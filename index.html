@@ -140,6 +140,18 @@ details.more > div{display:grid;gap:10px;margin-top:12px}
 textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line);border-radius:10px;background:var(--surface-2);color:var(--ink);padding:10px 12px;font-family:var(--f-mono);font-size:.82rem;line-height:1.5}
 .row-btns{display:flex;gap:8px;flex-wrap:wrap}
 
+.field{display:grid;gap:6px}
+.field label{font-weight:600;font-size:.9rem}
+.field input{font:inherit;border:1px solid var(--line);border-radius:10px;background:var(--surface-2);color:var(--ink);padding:10px 12px;min-height:44px;width:100%}
+.legend-row{display:flex;flex-wrap:wrap;gap:6px 14px;color:var(--muted)}
+.legend-row span{display:inline-flex;align-items:center;gap:6px}
+.legend-row i{width:12px;height:12px;border-radius:3px;display:inline-block}
+.scan-pages{display:grid;gap:12px}
+.scan-pages figure{margin:0;display:grid;gap:6px}
+.scan-pages .zoomwrap{overflow:auto;border-radius:10px;border:1px solid var(--line);background:#fff;max-height:70vh}
+.scan-pages canvas{display:block;width:100%;height:auto;cursor:zoom-in}
+.scan-pages .zoomwrap.zoom canvas{width:300%;cursor:zoom-out}
+.scan-pages figcaption{font-size:.82rem;color:var(--muted)}
 /* Score */
 .score-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
 .score-head > div{min-width:0}
@@ -256,28 +268,30 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
           <input id="galIn" class="vh" type="file" accept="image/*" multiple>
         </div>
         <ol id="photoGrid" class="photos" aria-label="Fotos in Seitenreihenfolge"></ol>
+        <div class="field">
+          <label for="titleIn">Titel des Stücks <span class="muted">(optional)</span></label>
+          <input id="titleIn" type="text" autocomplete="off" placeholder="z. B. Lobe den Herren">
+        </div>
         <p id="photoEmpty" class="empty">Noch keine Fotos. Tippe auf <b>Foto aufnehmen</b> für die erste Seite.</p>
         <ul class="tips">
           <li>Seite formatfüllend und gerade fotografieren, gutes Licht ohne Schatten.</li>
           <li>Kleine Noten oder volle Seiten: obere und untere Hälfte als zwei Fotos aufnehmen.</li>
-          <li>Nach der Erkennung kannst du jede Note prüfen und korrigieren.</li>
+          <li>Die Erkennung läuft komplett auf deinem Handy, die Fotos verlassen das Gerät nicht.</li>
+          <li>Danach siehst du auf dem Foto, was erkannt wurde, und kannst Fehler korrigieren.</li>
         </ul>
       </div>
 
       <div id="ocrPanel" class="card ocr" hidden aria-live="polite">
         <div class="ocr-head">
           <span class="spinner" id="ocrSpin" aria-hidden="true"></span>
-          <strong id="ocrStatus">Claude liest die Noten …</strong>
+          <strong id="ocrStatus">Noten werden erkannt …</strong>
           <span id="ocrTime" class="mono muted">0:00</span>
           <button type="button" id="ocrStop" class="btn ghost sm">Stopp</button>
         </div>
         <div class="bars" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
         <p class="muted small" id="ocrPhase">Fotos werden vorbereitet.</p>
-        <pre id="ocrLive" class="live"></pre>
         <p id="ocrErr" class="err" hidden></p>
       </div>
-
-      <p id="noOcr" class="note" hidden></p>
 
       <div class="card">
         <div class="cur-row">
@@ -315,6 +329,21 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
         <div class="paper"><div id="scoreOrig" class="score"></div></div>
         <div class="player" id="player-orig"></div>
         <p id="ocrNotes" class="note" hidden></p>
+        <details class="more" id="scanBox" hidden>
+          <summary>Erkennung auf den Fotos ansehen</summary>
+          <div>
+            <p class="legend-row small">
+              <span><i style="background:#2B6BFF"></i>Notenlinien</span>
+              <span><i style="background:#11A35B"></i>Noten</span>
+              <span><i style="background:#D61F69"></i>Halbe/Ganze</span>
+              <span><i style="background:#F08C00"></i>Pausen</span>
+              <span><i style="background:#E03131"></i>Vorzeichen</span>
+              <span><i style="background:#7B3FE4"></i>Taktstriche</span>
+              <span><i style="background:#0B8F8F"></i>Schlüssel, Tonart, Takt</span>
+            </p>
+            <div id="scanPages" class="scan-pages"></div>
+          </div>
+        </details>
         <details class="more" id="editBox">
           <summary>Noten korrigieren (ABC-Text)</summary>
           <div>
@@ -392,6 +421,1178 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
 </footer>
 <div id="toast" class="toast" role="status" hidden></div>
 
+<!-- Notenerkennung (OMR), läuft komplett im Browser. Wird als Web Worker und im Hauptthread geladen. -->
+<script id="omr-engine" type="text/plain">
+const OMR = (() => {
+"use strict";
+const R = Math.round;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const odd = n => { n = Math.max(3, R(n)); return n % 2 ? n : n + 1; };
+
+/* ================= Bild-Grundlagen ================= */
+function toGray(d, w, h) {
+  const g = new Uint8Array(w * h);
+  for (let i = 0, j = 0; i < w * h; i++, j += 4) g[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
+  return g;
+}
+function halve(g, w, h) {
+  const nw = w >> 1, nh = h >> 1, o = new Uint8Array(nw * nh);
+  for (let y = 0; y < nh; y++) {
+    const r0 = 2 * y * w, r1 = r0 + w;
+    for (let x = 0; x < nw; x++) { const i = 2 * x; o[y * nw + x] = (g[r0 + i] + g[r0 + i + 1] + g[r1 + i] + g[r1 + i + 1] + 2) >> 2; }
+  }
+  return { g: o, w: nw, h: nh };
+}
+function resize(g, w, h, nw, nh) {
+  while (nw < w / 2 - 1 && nh < h / 2 - 1) { const r = halve(g, w, h); g = r.g; w = r.w; h = r.h; }
+  const o = new Uint8Array(nw * nh), sx = w / nw, sy = h / nh;
+  for (let y = 0; y < nh; y++) {
+    let fy = (y + 0.5) * sy - 0.5; if (fy < 0) fy = 0;
+    const y0 = Math.min(h - 1, fy | 0), y1 = Math.min(h - 1, y0 + 1), ty = fy - y0;
+    for (let x = 0; x < nw; x++) {
+      let fx = (x + 0.5) * sx - 0.5; if (fx < 0) fx = 0;
+      const x0 = Math.min(w - 1, fx | 0), x1 = Math.min(w - 1, x0 + 1), tx = fx - x0;
+      const a = g[y0 * w + x0], b = g[y0 * w + x1], c = g[y1 * w + x0], d = g[y1 * w + x1];
+      o[y * nw + x] = ((a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty + 0.5) | 0;
+    }
+  }
+  return o;
+}
+// Bradley-Roth: lokaler Schwellwert, robust gegen Schatten und ungleichmäßiges Licht
+function binarize(g, w, h, win, t) {
+  const W1 = w + 1, I = new Uint32Array(W1 * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let s = 0; const o = y * w, r = (y + 1) * W1, p = y * W1;
+    for (let x = 0; x < w; x++) { s += g[o + x]; I[r + x + 1] = I[p + x + 1] + s; }
+  }
+  const b = new Uint8Array(w * h), rad = win >> 1, k = 1 - t;
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - rad), y1 = Math.min(h - 1, y + rad), A = y0 * W1, B = (y1 + 1) * W1;
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - rad), x1 = Math.min(w - 1, x + rad);
+      const cnt = (x1 - x0 + 1) * (y1 - y0 + 1);
+      const sum = I[B + x1 + 1] - I[A + x1 + 1] - I[B + x0] + I[A + x0];
+      const v = g[y * w + x] * cnt;
+      if (v < sum * k && sum - v > 14 * cnt) b[y * w + x] = 1;
+    }
+  }
+  return b;
+}
+// Lauflängen: häufigste schwarze Lauflänge = Liniendicke T, häufigstes Paar schwarz+weiß = Linienabstand S
+function runStats(b, w, h, center) {
+  const HB = new Float64Array(256), HP = new Float64Array(512);
+  const xa = center ? R(w * 0.2) : 0, xb = center ? R(w * 0.8) : w, ya = center ? R(h * 0.1) : 0, yb = center ? R(h * 0.9) : h;
+  for (let x = xa; x < xb; x += 2) {
+    let y = ya, prev = -1;
+    while (y < yb) {
+      const c = b[y * w + x], s = y;
+      while (y < yb && b[y * w + x] === c) y++;
+      const len = y - s;
+      if (c) { prev = len; if (len < 256) HB[len]++; }
+      else { if (prev > 0 && y < yb && prev + len < 512) HP[prev + len]++; prev = -1; }
+    }
+  }
+  let T = 1; for (let i = 1; i < 256; i++) if (HB[i] > HB[T]) T = i;
+  let S = Math.max(5, 2 * T + 2); for (let i = S; i < 512; i++) if (HP[i] > HP[S]) S = i;
+  let sw = 0, ss = 0; for (let i = S - 1; i <= S + 1; i++) { sw += HP[i]; ss += HP[i] * i; }
+  // weitere Kandidaten (falls ein Hintergrundmuster gewinnt)
+  const alt = [];
+  for (let i = Math.max(5, 2 * T + 2); i < 200; i++) if (Math.abs(i - S) > 2 && HP[i] >= HP[i - 1] && HP[i] >= HP[i + 1] && HP[i] > 0.15 * HP[S]) alt.push([HP[i], i]);
+  alt.sort((a, b2) => b2[0] - a[0]);
+  return { T, S: sw ? ss / sw : S, conf: HP[S], alt: alt.slice(0, 3).map(a => a[1]) };
+}
+function thinMask(b, w, h, maxL) {
+  const m = new Uint8Array(w * h);
+  for (let x = 0; x < w; x++) {
+    let y = 0;
+    while (y < h) {
+      if (!b[y * w + x]) { y++; continue; }
+      const s = y; while (y < h && b[y * w + x]) y++;
+      if (y - s <= maxL) for (let k = s; k < y; k++) m[k * w + x] = 1;
+    }
+  }
+  return m;
+}
+function estimateSkew(m, w, h) {
+  let cnt = 0; for (let i = 0; i < m.length; i++) cnt += m[i];
+  if (cnt < 100) return 0;
+  const step = Math.max(1, Math.ceil(cnt / 250000)), X = [], Y = [];
+  let c = 0;
+  for (let y = 0; y < h; y++) { const o = y * w; for (let x = 0; x < w; x++) if (m[o + x] && (c++ % step === 0)) { X.push(x); Y.push(y); } }
+  const n = X.length, off = w, H = new Float64Array(h + 2 * w);
+  const score = a => {
+    const t = Math.tan(a * Math.PI / 180); H.fill(0);
+    for (let i = 0; i < n; i++) { const v = R(Y[i] - X[i] * t) + off; if (v >= 0 && v < H.length) H[v]++; }
+    let s = 0; for (let i = 0; i < H.length; i++) s += H[i] * H[i]; return s;
+  };
+  let best = 0, bs = -1;
+  for (let a = -10; a <= 10; a += 0.5) { const s = score(a); if (s > bs) { bs = s; best = a; } }
+  let b2 = best;
+  for (let a = best - 0.45; a <= best + 0.45; a += 0.05) { const s = score(a); if (s > bs) { bs = s; b2 = a; } }
+  return b2;
+}
+function rotateGray(g, w, h, deg) {
+  const a = deg * Math.PI / 180, c = Math.cos(a), s = Math.sin(a), cx = w / 2, cy = h / 2, o = new Uint8Array(w * h).fill(255);
+  for (let y = 0; y < h; y++) {
+    const dy = y - cy;
+    for (let x = 0; x < w; x++) {
+      const dx = x - cx, sx = cx + dx * c - dy * s, sy = cy + dx * s + dy * c;
+      const x0 = Math.floor(sx), y0 = Math.floor(sy);
+      if (x0 < 0 || y0 < 0 || x0 >= w - 1 || y0 >= h - 1) continue;
+      const tx = sx - x0, ty = sy - y0, i = y0 * w + x0;
+      o[y * w + x] = ((g[i] * (1 - tx) + g[i + 1] * tx) * (1 - ty) + (g[i + w] * (1 - tx) + g[i + w + 1] * tx) * ty) | 0;
+    }
+  }
+  return o;
+}
+function integral(b, w, h) {
+  const W1 = w + 1, I = new Int32Array(W1 * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let s = 0; const o = y * w, r = (y + 1) * W1, p = y * W1;
+    for (let x = 0; x < w; x++) { s += b[o + x]; I[r + x + 1] = I[p + x + 1] + s; }
+  }
+  return I;
+}
+function makeFill(I, w, h) {
+  const W1 = w + 1;
+  return (x0, y0, x1, y1) => {
+    x0 = clamp(R(x0), 0, w - 1); x1 = clamp(R(x1), 0, w - 1); y0 = clamp(R(y0), 0, h - 1); y1 = clamp(R(y1), 0, h - 1);
+    if (x1 < x0 || y1 < y0) return 0;
+    const s = I[(y1 + 1) * W1 + x1 + 1] - I[y0 * W1 + x1 + 1] - I[(y1 + 1) * W1 + x0] + I[y0 * W1 + x0];
+    return s / ((x1 - x0 + 1) * (y1 - y0 + 1));
+  };
+}
+function label(mask, w, h) {
+  const lab = new Int32Array(w * h), comps = [null], st = [];
+  let id = 0;
+  for (let i = 0; i < w * h; i++) {
+    if (!mask[i] || lab[i]) continue;
+    id++; lab[i] = id; st.push(i);
+    let x0 = w, y0 = h, x1 = 0, y1 = 0, n = 0, sx = 0, sy = 0;
+    while (st.length) {
+      const p = st.pop(), y = (p / w) | 0, x = p - y * w;
+      n++; sx += x; sy += y;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy; if (yy < 0 || yy >= h) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx; if (xx < 0 || xx >= w) continue;
+          const q = yy * w + xx;
+          if (mask[q] && !lab[q]) { lab[q] = id; st.push(q); }
+        }
+      }
+    }
+    comps.push({ id, x0, y0, x1, y1, n, cx: sx / n, cy: sy / n });
+  }
+  return { lab, comps };
+}
+
+/* ================= Notenlinien ================= */
+function findStaves(m, w, h, S, T) {
+  const xa = R(w * 0.2), xb = R(w * 0.8), P = new Float64Array(h);
+  for (let y = 0; y < h; y++) { let s = 0; const o = y * w; for (let x = xa; x < xb; x++) s += m[o + x]; P[y] = s; }
+  const Q = new Float64Array(h);
+  for (let y = 1; y < h - 1; y++) Q[y] = P[y] + 0.5 * (P[y - 1] + P[y + 1]);
+  let mx = 0; for (let y = 0; y < h; y++) if (Q[y] > mx) mx = Q[y];
+  const thr = Math.max(0.16 * mx, 0.06 * (xb - xa)), r = Math.max(1, R(S * 0.3)), peaks = [];
+  for (let y = 1; y < h - 1; y++) {
+    const v = Q[y]; if (v < thr) continue;
+    let ok = true;
+    for (let d = 1; d <= r && ok; d++) if ((y - d >= 0 && Q[y - d] > v) || (y + d < h && Q[y + d] >= v)) ok = false;
+    if (!ok) continue;
+    let sw = 0, sy = 0;
+    for (let d = -T; d <= T; d++) { const yy = y + d; if (yy >= 0 && yy < h) { sw += P[yy]; sy += P[yy] * yy; } }
+    peaks.push({ y: sw ? sy / sw : y, v });
+  }
+  const staves = [], used = new Uint8Array(peaks.length);
+  const chain = i => {
+    const seq = [i]; let cur = i;
+    for (let k = 1; k < 5; k++) {
+      let best = -1, bv = -1;
+      for (let j = cur + 1; j < peaks.length; j++) {
+        const d = peaks[j].y - peaks[cur].y;
+        if (d < 0.7 * S) continue; if (d > 1.4 * S) break;
+        if (peaks[j].v > bv) { bv = peaks[j].v; best = j; }
+      }
+      if (best < 0) return null;
+      seq.push(best); cur = best;
+    }
+    return seq;
+  };
+  for (let i = 0; i < peaks.length; i++) {
+    if (used[i]) continue;
+    let seq = chain(i); if (!seq) continue;
+    // ein zusätzlicher stärkerer Peak direkt darunter: Folge um eins verschieben
+    const nx = chain(seq[1]);
+    if (nx && peaks[nx[4]].v > peaks[seq[0]].v * 1.6) seq = nx;
+    const ys = seq.map(j => peaks[j].y), ds = [1, 2, 3, 4].map(k => ys[k] - ys[k - 1]), md = (ys[4] - ys[0]) / 4;
+    if (Math.max(...ds.map(d => Math.abs(d - md))) > 0.3 * md) continue;
+    for (let j = i; j <= seq[4]; j++) used[j] = 1;
+    staves.push({ ys, S: md });
+  }
+  return staves;
+}
+function trackStaff(m, w, h, st, T) {
+  const S = st.S, SW = Math.max(16, R(4 * S)), n = Math.ceil(w / SW), hT = Math.max(1, Math.ceil(T / 2));
+  const val = [0, 1, 2, 3, 4].map(() => new Float64Array(n).fill(NaN));
+  const R0 = Math.max(2, R(0.45 * S));
+  const slice = (si, prev) => {
+    const xa = si * SW, xb = Math.min(w, xa + SW);
+    const ymin = Math.max(0, Math.floor(prev[0] - R0 - hT - 3)), ymax = Math.min(h - 1, Math.ceil(prev[4] + R0 + hT + 3));
+    const Pl = new Float64Array(ymax - ymin + 1);
+    for (let y = ymin; y <= ymax; y++) { let s = 0; const o = y * w; for (let x = xa; x < xb; x++) s += m[o + x]; Pl[y - ymin] = s; }
+    const at = y => { const i = R(y) - ymin; return i >= 0 && i < Pl.length ? Pl[i] : 0; };
+    let bo = 0, bs = -1;
+    for (let o = -R0; o <= R0; o++) {
+      let s = 0; for (let k = 0; k < 5; k++) { const y = prev[k] + o; s += Math.max(at(y - 1), at(y), at(y + 1)); }
+      if (s > bs) { bs = s; bo = o; }
+    }
+    const ys = prev.map(y => {
+      const y0 = R(y + bo); let sw = 0, sy = 0;
+      for (let d = -hT - 1; d <= hT + 1; d++) { const v = at(y0 + d); sw += v; sy += v * (y0 + d); }
+      return sw > 0 ? sy / sw : y0;
+    });
+    return { ev: bs / (5 * (xb - xa)), ys };
+  };
+  const s0 = clamp(Math.floor(w / 2 / SW), 0, n - 1);
+  const first = slice(s0, st.ys);
+  const base = first.ev >= 0.3 ? first.ys : st.ys;
+  if (first.ev >= 0.3) for (let k = 0; k < 5; k++) val[k][s0] = first.ys[k];
+  for (const dir of [1, -1]) {
+    let prev = base.slice(), miss = 0;
+    for (let si = s0 + dir; si >= 0 && si < n; si += dir) {
+      const q = slice(si, prev);
+      if (q.ev >= 0.3) { for (let k = 0; k < 5; k++) val[k][si] = q.ys[k]; prev = q.ys; miss = 0; }
+      else if (++miss >= 4) break;
+    }
+  }
+  const Y = [0, 1, 2, 3, 4].map(k => {
+    const arr = new Float32Array(w), pts = [];
+    for (let i = 0; i < n; i++) if (!isNaN(val[k][i])) pts.push([(i + 0.5) * SW, val[k][i]]);
+    if (!pts.length) { arr.fill(st.ys[k]); return arr; }
+    let j = 0;
+    for (let x = 0; x < w; x++) {
+      while (j < pts.length - 1 && pts[j + 1][0] < x) j++;
+      if (x <= pts[0][0]) arr[x] = pts[0][1];
+      else if (j >= pts.length - 1) arr[x] = pts[pts.length - 1][1];
+      else { const [xa, ya] = pts[j], [xb, yb] = pts[j + 1]; arr[x] = ya + (yb - ya) * (x - xa) / (xb - xa); }
+    }
+    return arr;
+  });
+  return Y;
+}
+function staffExtent(b, w, h, Y, S) {
+  const ok = new Uint8Array(w);
+  for (let x = 0; x < w; x++) {
+    let c = 0;
+    for (let k = 0; k < 5; k++) {
+      const y = R(Y[k][x]); if (y < 1 || y >= h - 1) continue;
+      if (b[y * w + x] || b[(y - 1) * w + x] || b[(y + 1) * w + x]) c++;
+    }
+    ok[x] = c >= 4 ? 1 : 0;
+  }
+  const gap = Math.max(3, R(0.8 * S));
+  let best = [0, -1], start = -1, last = -10 * w;
+  for (let x = 0; x < w; x++) {
+    if (!ok[x]) continue;
+    if (start < 0 || x - last > gap) start = x;
+    last = x;
+    if (last - start > best[1] - best[0]) best = [start, last];
+  }
+  return best;
+}
+function mkStaff(S, T, Y, x0, x1, w) {
+  const st = { S, T, Y, x0, x1 };
+  const at = x => clamp(R(x), 0, w - 1);
+  st.posY = (p, x) => { const i = at(x), a = Y[0][i], b = Y[4][i]; return a + p * (b - a) / 8; };
+  st.posOf = (y, x) => { const i = at(x), a = Y[0][i], b = Y[4][i]; return (y - a) / ((b - a) / 8); };
+  st.top = x => Y[0][at(x)]; st.bot = x => Y[4][at(x)];
+  let tmin = 1e9, bmax = -1e9;
+  for (let x = x0; x <= x1; x++) { if (Y[0][x] < tmin) tmin = Y[0][x]; if (Y[4][x] > bmax) bmax = Y[4][x]; }
+  st.tmin = tmin; st.bmax = bmax;
+  return st;
+}
+// Kleine eingeschlossene weiße Flächen = Löcher in hohlen Notenköpfen (mit Notenlinien, damit sie geschlossen sind)
+function findHoles(closed, w, h, S) {
+  const lab = new Int32Array(w * h), st = [], out = [];
+  let id = 0;
+  const maxW = 1.1 * S, maxH = 0.95 * S, minA = 0.06 * S * S;
+  for (let i = 0; i < w * h; i++) {
+    if (closed[i] || lab[i]) continue;
+    id++; lab[i] = id; st.push(i);
+    let x0 = w, y0 = h, x1 = -1, y1 = -1, n = 0, big = false;
+    const pix = [];
+    while (st.length) {
+      const p = st.pop(), y = (p / w) | 0, x = p - y * w;
+      n++; if (!big) pix.push(p);
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      if (x1 - x0 > maxW || y1 - y0 > maxH || x0 === 0 || y0 === 0 || x1 === w - 1 || y1 === h - 1) big = true;
+      if (x > 0 && !closed[p - 1] && !lab[p - 1]) { lab[p - 1] = id; st.push(p - 1); }
+      if (x < w - 1 && !closed[p + 1] && !lab[p + 1]) { lab[p + 1] = id; st.push(p + 1); }
+      if (y > 0 && !closed[p - w] && !lab[p - w]) { lab[p - w] = id; st.push(p - w); }
+      if (y < h - 1 && !closed[p + w] && !lab[p + w]) { lab[p + w] = id; st.push(p + w); }
+    }
+    if (big || n < minA) continue;
+    const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+    if (n / (bw * bh) > 0.93 && n > 0.1 * S * S) continue; // rechteckige Lücke zwischen Linien und Strichen
+    out.push({ x0, y0, x1, y1, n, pix, w: bw / S, h: bh / S, a: n / S / S });
+  }
+  return out;
+}
+function removeStaff(nb, w, h, st, lineMask) {
+  const maxL = Math.max(st.T + 2, R(st.T * 1.7) + 1);
+  for (let k = 0; k < 5; k++) {
+    for (let x = Math.max(0, st.x0 - 3); x <= Math.min(w - 1, st.x1 + 3); x++) {
+      const yc = R(st.Y[k][x]); let y = -1;
+      for (const d of [0, -1, 1, -2, 2]) { const yy = yc + d; if (yy >= 0 && yy < h && nb[yy * w + x]) { y = yy; break; } }
+      if (y < 0) continue;
+      let a = y, b = y;
+      while (a > 0 && nb[(a - 1) * w + x]) a--;
+      while (b < h - 1 && nb[(b + 1) * w + x]) b++;
+      if (b - a + 1 <= maxL) for (let yy = a; yy <= b; yy++) { nb[yy * w + x] = 0; lineMask[yy * w + x] = 1; }
+    }
+  }
+}
+function removeLedgers(nb, w, h, st, lineMask) {
+  const S = st.S, maxL = Math.max(st.T + 2, R(st.T * 1.7) + 1), minLen = Math.max(3, R(0.5 * S)), maxLen = R(4.5 * S);
+  const xa = Math.max(0, st.x0 - R(S)), xb = Math.min(w - 1, st.x1 + R(S));
+  const A = new Int32Array(w), B = new Int32Array(w), thin = new Uint8Array(w);
+  for (const p of [-2, -4, -6, -8, -10, 10, 12, 14, 16, 18]) {
+    thin.fill(0);
+    for (let x = xa; x <= xb; x++) {
+      const yc = R(st.posY(p, x)); let y = -1;
+      for (const d of [0, -1, 1]) { const yy = yc + d; if (yy >= 0 && yy < h && nb[yy * w + x]) { y = yy; break; } }
+      if (y < 0) continue;
+      let a = y, b = y;
+      while (a > 0 && nb[(a - 1) * w + x]) a--;
+      while (b < h - 1 && nb[(b + 1) * w + x]) b++;
+      if (b - a + 1 <= maxL) { thin[x] = 1; A[x] = a; B[x] = b; }
+    }
+    let x = xa;
+    while (x <= xb) {
+      if (!thin[x]) { x++; continue; }
+      const s = x; while (x <= xb && thin[x]) x++;
+      const L = x - s;
+      if (L >= minLen && L <= maxLen) for (let i = s; i < x; i++) for (let yy = A[i]; yy <= B[i]; yy++) { nb[yy * w + i] = 0; lineMask[yy * w + i] = 1; }
+    }
+  }
+}
+
+/* ================= Senkrechte Striche (Hälse, Taktstriche) ================= */
+function vSegments(nb, w, h, minLen, maxW) {
+  const segs = []; let active = [];
+  for (let x = 0; x < w; x++) {
+    const runs = []; let y = 0;
+    while (y < h) {
+      if (!nb[y * w + x]) { y++; continue; }
+      const s = y; while (y < h && nb[y * w + x]) y++;
+      if (y - s >= minLen) runs.push([s, y - 1]);
+    }
+    const next = [];
+    for (const r of runs) {
+      let seg = null;
+      for (const a of active) {
+        if (a.used) continue;
+        const ov = Math.min(a.ly1, r[1]) - Math.max(a.ly0, r[0]);
+        if (ov > 0.6 * Math.min(a.ly1 - a.ly0, r[1] - r[0])) { seg = a; break; }
+      }
+      if (seg) {
+        seg.used = true; seg.x1 = x; seg.ly0 = r[0]; seg.ly1 = r[1];
+        seg.sy0 += r[0]; seg.sy1 += r[1]; seg.c++;
+        seg.top = Math.min(seg.top, r[0]); seg.bot = Math.max(seg.bot, r[1]);
+        next.push(seg);
+      } else {
+        const s = { x0: x, x1: x, ly0: r[0], ly1: r[1], sy0: r[0], sy1: r[1], c: 1, top: r[0], bot: r[1], used: true };
+        segs.push(s); next.push(s);
+      }
+    }
+    for (const s of next) s.used = false;
+    active = next;
+  }
+  return segs.filter(s => s.x1 - s.x0 + 1 <= maxW).map(s => ({
+    x0: s.x0, x1: s.x1, x: (s.x0 + s.x1) / 2, wd: s.x1 - s.x0 + 1,
+    y0: s.sy0 / s.c, y1: s.sy1 / s.c, top: s.top, bot: s.bot
+  }));
+}
+
+/* ================= Glyphen (Gruppen zusammenhängender Komponenten) ================= */
+function groupGlyphs(comps, S) {
+  comps = comps.slice().sort((a, b) => a.x0 - b.x0);
+  const n = comps.length, par = comps.map((_, i) => i);
+  const find = i => { while (par[i] !== i) { par[i] = par[par[i]]; i = par[i]; } return i; };
+  for (let i = 0; i < n; i++) {
+    const a = comps[i];
+    for (let j = i + 1; j < n; j++) {
+      const b = comps[j];
+      if (b.x0 > a.x1) break;
+      const ov = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0) + 1;
+      const mw = Math.min(a.x1 - a.x0 + 1, b.x1 - b.x0 + 1);
+      if (ov < 0.5 * mw) continue;
+      const gap = Math.max(a.y0, b.y0) - Math.min(a.y1, b.y1);
+      if (gap <= 0.6 * S) par[find(j)] = find(i);
+    }
+  }
+  const groups = new Map();
+  comps.forEach((c, i) => {
+    const r = find(i);
+    let g = groups.get(r);
+    if (!g) { g = { x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1, n: 0, ids: new Set() }; groups.set(r, g); }
+    g.x0 = Math.min(g.x0, c.x0); g.y0 = Math.min(g.y0, c.y0); g.x1 = Math.max(g.x1, c.x1); g.y1 = Math.max(g.y1, c.y1);
+    g.n += c.n; g.ids.add(c.id);
+  });
+  return [...groups.values()].sort((a, b) => a.x0 - b.x0);
+}
+function glyphTools(lab, w) {
+  const has = (g, x, y) => g.ids.has(lab[y * w + x]);
+  const fillIn = (g, x0, y0, x1, y1) => {
+    x0 = Math.max(g.x0, R(x0)); x1 = Math.min(g.x1, R(x1)); y0 = Math.max(g.y0, R(y0)); y1 = Math.min(g.y1, R(y1));
+    if (x1 < x0 || y1 < y0) return 0;
+    let c = 0; for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) if (has(g, x, y)) c++;
+    return c / ((x1 - x0 + 1) * (y1 - y0 + 1));
+  };
+  const strokes = (g, minRun) => {
+    const out = []; let cur = null;
+    for (let x = g.x0; x <= g.x1; x++) {
+      let best = 0, by0 = 0, by1 = 0, y = g.y0;
+      while (y <= g.y1) {
+        if (!has(g, x, y)) { y++; continue; }
+        const s = y; while (y <= g.y1 && has(g, x, y)) y++;
+        if (y - s > best) { best = y - s; by0 = s; by1 = y - 1; }
+      }
+      if (best >= minRun) {
+        if (cur && cur.x1 === x - 1) { cur.x1 = x; cur.y0 = Math.min(cur.y0, by0); cur.y1 = Math.max(cur.y1, by1); }
+        else { cur = { x0: x, x1: x, y0: by0, y1: by1 }; out.push(cur); }
+      }
+    }
+    return out;
+  };
+  // Anteil der Zeilen mit zwei oder mehr getrennten Abschnitten (Fähnchen-Pausen haben das, Viertelpausen kaum)
+  const twoRuns = g => {
+    let rows = 0, two = 0;
+    for (let y = g.y0; y <= g.y1; y++) {
+      let runs = 0, inRun = false;
+      for (let x = g.x0; x <= g.x1; x++) { const v = has(g, x, y); if (v && !inRun) runs++; inRun = v; }
+      if (runs) { rows++; if (runs >= 2) two++; }
+    }
+    return rows ? two / rows : 0;
+  };
+  const slope = g => {
+    let n = 0, sy = 0, sx = 0, sxy = 0, syy = 0;
+    for (let y = g.y0; y <= g.y1; y++) {
+      let c = 0, s = 0;
+      for (let x = g.x0; x <= g.x1; x++) if (has(g, x, y)) { c++; s += x; }
+      if (!c) continue;
+      const cx = s / c; n++; sy += y; sx += cx; sxy += y * cx; syy += y * y;
+    }
+    if (n < 3) return 0;
+    const v = syy - sy * sy / n; return v ? (sxy - sx * sy / n) / v : 0;
+  };
+  // horizontale Lage der Tinte im unteren Drittel (0 = links, 1 = rechts)
+  const bottomBias = g => {
+    let c = 0, sx = 0;
+    for (let y = R(g.y1 - (g.y1 - g.y0) / 3); y <= g.y1; y++) for (let x = g.x0; x <= g.x1; x++) if (has(g, x, y)) { c++; sx += x; }
+    return c ? (sx / c - g.x0) / Math.max(1, g.x1 - g.x0) : 0.5;
+  };
+  return { has, fillIn, strokes, slope, twoRuns, bottomBias };
+}
+function zoneFeatures(get, x0, y0, x1, y1) {
+  const GX = 5, GY = 7, f = new Array(GX * GY + 1).fill(0), W = x1 - x0 + 1, H = y1 - y0 + 1;
+  for (let gy = 0; gy < GY; gy++) for (let gx = 0; gx < GX; gx++) {
+    const xa = x0 + Math.floor(gx * W / GX), xb = Math.max(xa, x0 + Math.floor((gx + 1) * W / GX) - 1);
+    const ya = y0 + Math.floor(gy * H / GY), yb = Math.max(ya, y0 + Math.floor((gy + 1) * H / GY) - 1);
+    let c = 0, t = 0;
+    for (let y = ya; y <= yb; y++) for (let x = xa; x <= xb; x++) { t++; if (get(x, y)) c++; }
+    f[gy * GX + gx] = t ? c / t : 0;
+  }
+  f[GX * GY] = W / H;
+  return f;
+}
+function featDist(a, b) {
+  let s = 0; for (let i = 0; i < a.length - 1; i++) { const d = a[i] - b[i]; s += d * d; }
+  return Math.sqrt(s) + 1.2 * Math.abs(a[a.length - 1] - b[b.length - 1]);
+}
+function tightBox(get, x0, y0, x1, y1) {
+  let a = x1 + 1, b = y1 + 1, c = x0 - 1, d = y0 - 1;
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) if (get(x, y)) { if (x < a) a = x; if (x > c) c = x; if (y < b) b = y; if (y > d) d = y; }
+  return c < a ? null : { x0: a, y0: b, x1: c, y1: d };
+}
+function classifyChar(feat, templates, allowed) {
+  let best = null, bd = 1e9;
+  for (const t of templates) { if (allowed && !allowed.includes(t.ch)) continue; const d = featDist(feat, t.f); if (d < bd) { bd = d; best = t.ch; } }
+  return { ch: best, d: bd };
+}
+
+/* ================= Hauptfunktion pro Seite ================= */
+function processPage(rgba, W0, H0, opts, progress) {
+  opts = opts || {};
+  progress = progress || (() => {});
+  const warnings = [];
+  progress("Kontrast wird angepasst", 0.05);
+  const g0 = toGray(rgba, W0, H0);
+  const b0 = binarize(g0, W0, H0, odd(Math.max(W0, H0) / 18), 0.15);
+  const st0 = runStats(b0, W0, H0, true);
+  const cands = [st0.S, ...st0.alt];
+  let out = null;
+  for (let i = 0; i < cands.length && i < 3; i++) {
+    out = processWithS(g0, W0, H0, cands[i], opts, progress, []);
+    if (out.staves.length) break;
+  }
+  return out;
+}
+function processWithS(g0, W0, H0, Sguess, opts, progress, warnings) {
+  let w = W0, h = H0, g = g0, scale = 1, b, st;
+  if (Sguess < 8) warnings.push(`Die Notenlinien liegen im Foto nur etwa ${Math.max(1, R(Sguess))} Pixel auseinander, gut wären 12 oder mehr. Fotografiere näher, eine halbe Seite pro Foto oder in voller Auflösung.`);
+  // Normalisieren: Linienabstand auf ca. 16 px
+  const f = clamp(16 / Sguess, 0.3, 2.4);
+  if (Math.abs(f - 1) > 0.25 && w * f * h * f <= 14e6) {
+    const nw = R(w * f), nh = R(h * f);
+    g = resize(g, w, h, nw, nh); w = nw; h = nh; scale = f;
+  }
+  b = binarize(g, w, h, odd(16 * 10), 0.15);
+  st = runStats(b, w, h, true);
+  progress("Schräglage wird korrigiert", 0.15);
+  let maxL = Math.max(st.T + 2, R(st.T * 1.8) + 1);
+  let thin = thinMask(b, w, h, maxL);
+  const angle = estimateSkew(thin, w, h);
+  if (Math.abs(angle) > 0.08) {
+    g = rotateGray(g, w, h, angle);
+    b = binarize(g, w, h, odd(st.S * 10), 0.15);
+    st = runStats(b, w, h, true);
+    maxL = Math.max(st.T + 2, R(st.T * 1.8) + 1);
+    thin = thinMask(b, w, h, maxL);
+  }
+  g = null;
+  const T = st.T, S0 = st.S;
+  progress("Notenlinien werden gesucht", 0.25);
+  const found = findStaves(thin, w, h, S0, T);
+  const staves = [];
+  for (const fs of found) {
+    const Y = trackStaff(thin, w, h, fs, T);
+    const [x0, x1] = staffExtent(b, w, h, Y, fs.S);
+    if (x1 - x0 < 8 * fs.S) continue;
+    staves.push(mkStaff(fs.S, T, Y, x0, x1, w));
+  }
+  thin = null;
+  staves.sort((a, b2) => a.tmin - b2.tmin);
+  const base = { w, h, scale, angle, S: S0, T, staves: [], systems: [], warnings };
+  if (!staves.length) { warnings.push("Auf diesem Foto wurden keine Notenlinien gefunden."); return base; }
+
+  progress("Notenlinien werden entfernt", 0.35);
+  const nb = b.slice(), lineMask = new Uint8Array(w * h);
+  for (const s of staves) removeStaff(nb, w, h, s, lineMask);
+  for (const s of staves) removeLedgers(nb, w, h, s, lineMask);
+  const I = integral(nb, w, h), fill = makeFill(I, w, h);
+  const Smed = staves.map(s => s.S).sort((a, b2) => a - b2)[staves.length >> 1];
+  progress("Hälse und Taktstriche werden gesucht", 0.4);
+  const segs = vSegments(nb, w, h, R(2.3 * Smed), Math.max(3, R(0.9 * Smed)));
+  progress("Hohle Notenköpfe werden gesucht", 0.45);
+  const closed = nb.slice();
+  for (let i = 0; i < w * h; i++) if (lineMask[i]) closed[i] = 1;
+  const holeList = findHoles(closed, w, h, Smed).filter(hl => {
+    // Lücke zwischen zwei Hälsen (eng stehende Sechzehntel) ist kein Notenkopf
+    const cover = sg => sg.top <= hl.y0 + 0.1 * Smed && sg.bot >= hl.y1 - 0.1 * Smed;
+    const L = segs.some(sg => cover(sg) && sg.x >= hl.x0 - 0.35 * Smed && sg.x <= hl.x0 + 0.1 * Smed);
+    const Rr = segs.some(sg => cover(sg) && sg.x >= hl.x1 - 0.1 * Smed && sg.x <= hl.x1 + 0.35 * Smed);
+    if (L && Rr) return false;
+    // Lücke direkt neben einem gefüllten Kopf (z. B. zwischen Vorzeichen und Note) ist kein Loch eines Kopfes
+    const yc = (hl.y0 + hl.y1) / 2, q = 0.22 * Smed;
+    if (fill(hl.x1 + 1, yc - q, hl.x1 + 0.6 * Smed, yc + q) > 0.85 || fill(hl.x0 - 0.6 * Smed, yc - q, hl.x0 - 1, yc + q) > 0.85) return false;
+    return true;
+  });
+  const holes = new Uint8Array(w * h);
+  for (const hl of holeList) for (const p of hl.pix) holes[p] = 1;
+  const nbF = closed;
+  for (let i = 0; i < w * h; i++) if (holes[i]) nbF[i] = 1;
+  const fillF = makeFill(integral(nbF, w, h), w, h), fillH = makeFill(integral(holes, w, h), w, h);
+  progress("Symbole werden zerlegt", 0.55);
+  const { lab, comps } = label(nb, w, h);
+  const GT = glyphTools(lab, w);
+  const ctx = { b, nb, nbF, w, h, fill, fillF, fillH, lab, comps, GT, segs, templates: opts.templates || [], debug: !!opts.debug, holeThr: opts.holeThr || 0.15 };
+
+  const out = [];
+  staves.forEach((s, si) => {
+    progress(`Notensystem ${si + 1} von ${staves.length} wird gelesen`, 0.6 + 0.35 * si / staves.length);
+    out.push(readStaff(ctx, s, si, staves));
+  });
+  // Systeme: Notenzeilen, die durch Taktstriche verbunden sind
+  const systems = []; let cur = [0];
+  for (let i = 1; i < staves.length; i++) {
+    const a = staves[i - 1], c = staves[i];
+    const linked = segs.some(sg => sg.top <= a.bmax + 0.5 * a.S && sg.bot >= c.tmin - 0.5 * c.S && sg.top < a.bmax && sg.bot > c.tmin &&
+      sg.x >= Math.max(a.x0, c.x0) - a.S && sg.x <= Math.min(a.x1, c.x1) + a.S);
+    if (linked) cur.push(i); else { systems.push(cur); cur = [i]; }
+  }
+  systems.push(cur);
+  base.staves = out; base.systems = systems;
+  if (opts.debug) { base._nb = nb; base._b = b; base._holes = holeList.map(hl => ({ x: hl.x0, y: hl.y0, w: +hl.w.toFixed(2), h: +hl.h.toFixed(2), a: +hl.a.toFixed(3) })); }
+  progress("Fertig", 1);
+  return base;
+}
+
+function readStaff(ctx, s, si, all) {
+  const { nb, w, h, fill, lab, comps, GT, segs } = ctx, S = s.S;
+  const res = { idx: si, S, x0: s.x0, x1: s.x1, clef: null, sharps: 0, flats: 0, ts: null, events: [], dbg: { heads: [], rests: [], accs: [], bars: [], boxes: [], dots: [] } };
+  res.lines = [0, 1, 2, 3, 4].map(k => { const pts = []; for (let x = s.x0; x <= s.x1; x += Math.max(4, R(2 * S))) pts.push([x, s.Y[k][x]]); pts.push([s.x1, s.Y[k][s.x1]]); return pts; });
+  const bandTop = s.tmin - 4.5 * S, bandBot = s.bmax + 4.5 * S;
+  const inBand = c => c.cy > s.tmin - 3 * S && c.cy < s.bmax + 3 * S;
+  const near = comps.filter(c => c && c.x1 >= s.x0 - S && c.x0 <= s.x1 + S && c.y1 > bandTop && c.y0 < bandBot && c.n >= 0.015 * S * S);
+
+  /* ---- Anfang der Zeile: Schlüssel, Vorzeichen, Taktart ---- */
+  const pre = groupGlyphs(near.filter(c => c.x0 <= s.x0 + 18 * S && c.x0 >= s.x0 - 0.3 * S && inBand(c)), S);
+  const xm = s.x0 + 2 * S, top = s.top(xm), bot = s.bot(xm), mid = (top + bot) / 2;
+  let U = null, x = s.x0;
+  for (const gl of pre) {
+    if (gl.x0 > s.x0 + 3.4 * S) break;
+    const gw = gl.x1 - gl.x0 + 1, gh = gl.y1 - gl.y0 + 1;
+    if (gw < 0.5 * S && gh > 3.4 * S) continue;
+    if (!U) { if ((gl.x0 + gl.x1) / 2 <= s.x0 + 3.4 * S && gh >= 1.2 * S) U = { x0: gl.x0, y0: gl.y0, x1: gl.x1, y1: gl.y1 }; }
+    else if (gl.x0 <= U.x1 + 0.15 * S) U = { x0: Math.min(U.x0, gl.x0), y0: Math.min(U.y0, gl.y0), x1: Math.max(U.x1, gl.x1), y1: Math.max(U.y1, gl.y1) };
+  }
+  if (U) {
+    const H = (U.y1 - U.y0 + 1) / S;
+    if (H >= 2) {
+      if (H >= 5) res.clef = "treble";
+      else if (U.y1 < bot - 0.6 * S) res.clef = "bass";
+      else if (H >= 3.0) {
+        // C-Schlüssel: die Mitte zeigt auf die Linie des c'
+        const pc = s.posOf((U.y0 + U.y1) / 2, (U.x0 + U.x1) / 2), line = clamp(R(pc / 2), 0, 4);
+        res.clef = ["bass3", "tenor", "alto", "alto2", "alto1"][line];
+      } else res.clef = "treble";
+      res.dbg.boxes.push({ ...U, kind: "clef", label: CLEF_NAMES[res.clef] || "Schlüssel" });
+      x = U.x1;
+    }
+  }
+  // Tonart: Kreuze und Bs; bei kleinen Fotos zerfällt ein Kreuz in zwei Striche oder verschmilzt zu einem Block
+  const narrow = g => (g.x1 - g.x0 + 1) < 0.5 * S && (g.y1 - g.y0 + 1) >= 1.4 * S && (g.y1 - g.y0 + 1) <= 3.2 * S;
+  for (let i = 0; i < pre.length; i++) {
+    const gl = pre[i];
+    if (gl.x0 < x - 0.2 * S) continue;
+    if (gl.x0 > x + 1.8 * S) break;
+    if ((gl.y1 - gl.y0) < 1.4 * S && (gl.x1 - gl.x0) < 0.7 * S) { if (res.clef === "bass") x = gl.x1; continue; } // Punkte des Bassschlüssels
+    let t = classifyAcc(GT, gl, S), box = gl;
+    if (!t && narrow(gl) && pre[i + 1] && narrow(pre[i + 1]) && pre[i + 1].x0 - gl.x1 < 0.55 * S && Math.abs(pre[i + 1].y0 - gl.y0) < 0.9 * S) {
+      t = "sharp"; box = { x0: gl.x0, y0: Math.min(gl.y0, pre[i + 1].y0), x1: pre[i + 1].x1, y1: Math.max(gl.y1, pre[i + 1].y1) }; i++;
+    }
+    if (!t) {
+      const gw = (gl.x1 - gl.x0 + 1) / S, gh = (gl.y1 - gl.y0 + 1) / S;
+      if (gw >= 0.55 && gw <= 1.3 && gh >= 1.6 && gh <= 3.2) {
+        const lo = GT.fillIn(gl, gl.x0, gl.y1 - 0.9 * S, gl.x1, gl.y1), hi = GT.fillIn(gl, gl.x0, gl.y0, gl.x1, gl.y0 + 0.9 * S);
+        t = lo > hi + 0.15 ? "flat" : (Math.abs(lo - hi) < 0.18 && gl.n / ((gl.x1 - gl.x0 + 1) * (gl.y1 - gl.y0 + 1)) > 0.4 && GT.strokes(gl, R(0.9 * S)).length >= 2 ? "sharp" : null);
+      }
+    }
+    if ((t === "sharp" && res.flats) || (t === "flat" && res.sharps)) break;
+    if (t === "sharp") res.sharps++; else if (t === "flat") res.flats++; else break;
+    res.dbg.boxes.push({ x0: box.x0, y0: box.y0, x1: box.x1, y1: box.y1, kind: "key", label: t === "sharp" ? "♯" : "♭" });
+    x = box.x1;
+  }
+  // Taktart: alle Bruchstücke im Bereich nach der Tonart zusammennehmen
+  const cand = pre.filter(gl => gl.x0 >= x - 0.3 * S && gl.x0 <= x + 2.4 * S && gl.y1 > top - 0.6 * S && gl.y0 < bot + 0.6 * S && (gl.y1 - gl.y0) >= 0.3 * S);
+  if (cand.length && ctx.templates.length) {
+    const x0c = cand[0].x0;
+    const col = cand.filter(gl => gl.x0 <= x0c + 1.2 * S && gl.x1 <= x0c + 2.6 * S);
+    const T2 = col.reduce((a, gl) => ({ x0: Math.min(a.x0, gl.x0), y0: Math.min(a.y0, gl.y0), x1: Math.max(a.x1, gl.x1), y1: Math.max(a.y1, gl.y1) }), { x0: 1e9, y0: 1e9, x1: -1, y1: -1 });
+    // Taktart enthält keinen Notenkopf (dicker Fleck) und keinen Hals mit Kopf
+    let blob = false;
+    for (let yy = T2.y0; yy <= T2.y1 && !blob; yy += Math.max(1, R(S / 4)))
+      for (let xx = T2.x0; xx <= T2.x1; xx += Math.max(1, R(S / 4)))
+        if (ctx.fill(xx - 0.3 * S, yy - 0.3 * S, xx + 0.3 * S, yy + 0.3 * S) > 0.93) { blob = true; break; }
+    const getter = (x2, y2) => col.some(gl => gl.ids.has(lab[y2 * w + x2]));
+    const Hs = (T2.y1 - T2.y0 + 1) / S, Ws = (T2.x1 - T2.x0 + 1) / S, centered = Math.abs((T2.y0 + T2.y1) / 2 - mid) < 0.8 * S;
+    if (!blob && Hs >= 3.2 && Hs <= 4.9 && !(centered && GT.strokes({ ...T2, ids: new Set(col.flatMap(g => [...g.ids])) }, R(2.4 * S)).length)) {
+      const up = tightBox(getter, T2.x0, T2.y0, T2.x1, R(mid) - 1), dn = tightBox(getter, T2.x0, R(mid) + 1, T2.x1, T2.y1);
+      if (up && dn && (up.y1 - up.y0 + 1) >= 1.2 * S && (dn.y1 - dn.y0 + 1) >= 1.2 * S) {
+        const a = classifyChar(zoneFeatures(getter, up.x0, up.y0, up.x1, up.y1), ctx.templates, ["2", "3", "4", "5", "6", "7", "9"]);
+        const c = classifyChar(zoneFeatures(getter, dn.x0, dn.y0, dn.x1, dn.y1), ctx.templates, ["2", "4", "8"]);
+        if (a.d < 2.4 && c.d < 2.4) { res.ts = { num: +a.ch, den: +c.ch, d: a.d + c.d }; x = T2.x1; res.dbg.boxes.push({ ...T2, kind: "time", label: a.ch + "/" + c.ch }); }
+      }
+    } else if (!blob && centered && Ws >= 0.7 && Ws <= 2.2 && Hs >= 1.4 && Hs <= 4.9) {
+      // C (4/4) oder durchgestrichenes C (Alla breve, 2/2): rechts in der Mitte offen, links geschlossen
+      const ids = new Set(col.flatMap(g => [...g.ids])), G = { ...T2, ids };
+      const cut = Hs >= 2.6 && GT.strokes(G, R(2.2 * S)).length >= 1;
+      const yA = R(mid - 0.95 * S), yB = R(mid + 0.95 * S);
+      const tb = tightBox(getter, T2.x0, Math.max(T2.y0, yA), T2.x1, Math.min(T2.y1, yB));
+      if (tb) {
+        const wC = tb.x1 - tb.x0 + 1;
+        const openRight = GT.fillIn(G, tb.x0 + 0.6 * wC, mid - 0.2 * S, tb.x1, mid + 0.2 * S) < (cut ? 0.35 : 0.2);
+        const leftInk = GT.fillIn(G, tb.x0, mid - 0.3 * S, tb.x0 + 0.3 * wC, mid + 0.3 * S) > 0.3;
+        const a = classifyChar(zoneFeatures(getter, tb.x0, tb.y0, tb.x1, tb.y1), ctx.templates, ["C"]);
+        if (ctx.debug) res.dbg.cdist = a.d;
+        if ((openRight && leftInk) || a.d < 2.0) {
+          res.ts = cut ? { num: 2, den: 2, cut: true } : { num: 4, den: 4, common: true };
+          x = T2.x1; res.dbg.boxes.push({ ...T2, kind: "time", label: cut ? "¢" : "C" });
+        }
+      }
+    }
+  }
+  const contentStart = x + 0.3 * S;
+  res.contentStart = contentStart;
+  if (ctx.debug) res.dbg.pre = pre.slice(0, 8).map(g => `${R((g.x0 - s.x0) / S * 10) / 10}+${R((g.x1 - g.x0) / S * 10) / 10}w ${R((g.y1 - g.y0) / S * 10) / 10}h y${R((g.y0 - top) / S * 10) / 10}`);
+  // Noten außerhalb der fünf Linien brauchen Hilfslinien (im Originalbild)
+  const bimg = ctx.b;
+  const ledgerAt = (q, x2) => {
+    const y = R(s.posY(q, x2)), xa = Math.max(0, R(x2 - 0.75 * S)), xb = Math.min(w - 1, R(x2 + 0.75 * S));
+    let c = 0;
+    for (let xx = xa; xx <= xb; xx++) {
+      let hit = 0;
+      for (let d = -2; d <= 2 && !hit; d++) { const yy = y + d; if (yy >= 0 && yy < h && bimg[yy * w + xx]) hit = 1; }
+      c += hit;
+    }
+    return c >= 0.8 * (xb - xa + 1);
+  };
+  const ledgersOk = (p, x2) => {
+    if (p >= -1 && p <= 9) return true;
+    if (p < -1) { for (let q = -2; q >= p; q -= 2) if (!ledgerAt(q, x2)) return false; return true; }
+    for (let q = 10; q <= p; q += 2) if (!ledgerAt(q, x2)) return false; return true;
+  };
+
+  /* ---- Notenköpfe: Erosion mit einem Rechteck, das nur in (gefüllten oder geschlossenen) Köpfen Platz hat ---- */
+  const heads = [];
+  {
+    const nbF = ctx.nbF, fillF = ctx.fillF, fillH = ctx.fillH;
+    const a = Math.max(1, R(0.27 * S)), bq = Math.max(1, R(0.28 * S)), full = (2 * a + 1) * (2 * bq + 1), need = full * 0.95;
+    const xA = Math.max(a + 1, R(contentStart)), xB = Math.min(w - 2 - a, R(s.x1 + S));
+    const yA = Math.max(bq + 1, R(s.tmin - 4.5 * S)), yB = Math.min(h - 2 - bq, R(s.bmax + 4.5 * S));
+    if (xB > xA && yB > yA) {
+      const bw = xB - xA + 1, bh = yB - yA + 1, er = new Uint8Array(bw * bh);
+      for (let y = yA; y <= yB; y++) for (let x2 = xA; x2 <= xB; x2++) {
+        if (!nbF[y * w + x2]) continue;
+        if (fillF(x2 - a, y - bq, x2 + a, y + bq) * full >= need) er[(y - yA) * bw + x2 - xA] = 1;
+      }
+      const L = label(er, bw, bh);
+      for (const c of L.comps) {
+        if (!c) continue;
+        const W = (c.x1 - c.x0 + 1) + 2 * a, H = (c.y1 - c.y0 + 1) + 2 * bq;
+        if (W < 0.75 * S || H < 0.6 * S || W > 2.9 * S || H > 4.8 * S) continue;
+        const holeAll = fillH(c.x0 + xA - a, c.y0 + yA - bq, c.x1 + xA + a, c.y1 + yA + bq) * W * H / (S * S);
+        const nx = W > 2.05 * S && holeAll < 0.05 * (H / S) ? 2 : 1;
+        const breve = nx === 1 && W > 2.3 * S && W <= 3.3 * S && holeAll >= 0.1;
+        if (W > 2.3 * S && nx === 1 && !breve) continue;
+        if (nx === 2 && H < 1.2 * S) continue;
+        for (let ix = 0; ix < nx; ix++) {
+          const xa = c.x0 + Math.floor(ix * (c.x1 - c.x0 + 1) / nx), xb = c.x0 + Math.floor((ix + 1) * (c.x1 - c.x0 + 1) / nx) - 1;
+          let ymin = 1e9, ymax = -1;
+          for (let y = c.y0; y <= c.y1; y++) for (let x2 = xa; x2 <= xb; x2++) if (L.lab[y * bw + x2] === c.id) { if (y < ymin) ymin = y; if (y > ymax) ymax = y; }
+          if (ymax < 0) continue;
+          const Hh = ymax - ymin + 1 + 2 * bq, ny = Math.max(1, R(Hh / (1.05 * S)));
+          for (let iy = 0; iy < ny; iy++) {
+            const ya = ymin + Math.floor(iy * (ymax - ymin + 1) / ny), yb = ymin + Math.floor((iy + 1) * (ymax - ymin + 1) / ny) - 1;
+            let n = 0, sx = 0, sy = 0;
+            for (let y = ya; y <= yb; y++) for (let x2 = xa; x2 <= xb; x2++) if (L.lab[y * bw + x2] === c.id) { n++; sx += x2; sy += y; }
+            if (!n) continue;
+            const hx = sx / n + xA, hy = sy / n + yA;
+            const p = R(s.posOf(hy, hx));
+            if (p < -9 || p > 17 || !ledgersOk(p, hx)) continue;
+            const hole = fillH(hx - 0.6 * S, hy - 0.42 * S, hx + 0.6 * S, hy + 0.42 * S) * 1.2 * 0.84;
+            const wd = (xb - xa + 1 + 2 * a) / S;
+            heads.push({ x: hx, y: hy, p, filled: hole < ctx.holeThr && !breve, hole, wide: wd > 1.45 || breve, breve });
+          }
+        }
+      }
+    }
+  }
+
+  /* ---- Hälse zuordnen ---- */
+  const stemSegs = segs.filter(sg => sg.wd <= Math.max(3, 0.45 * S) && sg.bot > s.tmin - 5 * S && sg.top < s.bmax + 5 * S && sg.x >= contentStart - S && sg.x <= s.x1 + S);
+  for (const hd of heads) {
+    let best = null, bd = 1e9;
+    for (const sg of stemSegs) {
+      const dx = sg.x - hd.x, adx = Math.abs(dx);
+      if (adx < 0.25 * S || adx > 1.1 * S) continue;
+      if (hd.y < sg.y0 - 0.7 * S || hd.y > sg.y1 + 0.7 * S) continue;
+      if (dx > 0 && hd.y < sg.y0 + 1.6 * S) continue;
+      if (dx < 0 && hd.y > sg.y1 - 1.6 * S) continue;
+      // Taktstrich-artig (genau Linie 1 bis 5): nur wenn der Kopf ganz am Ende sitzt
+      const barLike = Math.abs(sg.top - s.top(sg.x)) < 0.4 * S && Math.abs(sg.bot - s.bot(sg.x)) < 0.4 * S;
+      if (barLike && Math.min(Math.abs(hd.y - sg.y1), Math.abs(hd.y - sg.y0)) > 0.7 * S) continue;
+      const sc = adx + 0.1 * Math.min(Math.abs(hd.y - sg.y1), Math.abs(hd.y - sg.y0));
+      if (sc < bd) { bd = sc; best = sg; }
+    }
+    hd.stem = best;
+  }
+  // Ein Hals trägt Köpfe nur an einem Ende: Köpfe an der Gegenseite (meist Balken) verwerfen
+  {
+    const by = new Map();
+    for (const hd of heads) if (hd.stem) { if (!by.has(hd.stem)) by.set(hd.stem, []); by.get(hd.stem).push(hd); }
+    for (const [sg, hs] of by) {
+      const upH = hs.filter(hd => hd.x < sg.x), dnH = hs.filter(hd => hd.x >= sg.x);
+      if (!upH.length || !dnH.length) continue;
+      const lowEnd = Math.max(...hs.map(hd => hd.y)), highEnd = Math.min(...hs.map(hd => hd.y));
+      // Kopf links vom Hals gehört nach unten, rechts nach oben; Abweichler mit großem Abstand entfernen
+      const keepUp = upH.length >= dnH.length;
+      const main = keepUp ? upH : dnH, other = keepUp ? dnH : upH;
+      for (const hd of other) if (Math.min(...main.map(m => Math.abs(m.y - hd.y))) > 1.2 * S) hd.stem = null, hd.drop = true;
+      void lowEnd; void highEnd;
+    }
+  }
+  // gefüllte Köpfe brauchen einen Hals; hohle ohne Hals sind Ganze und müssen breit sein;
+  // an einem Hals gibt es nur eine Kopfart
+  const stemHasFilled = new Set(heads.filter(hd => hd.stem && hd.filled).map(hd => hd.stem));
+  const goodHeads = heads.filter(hd => {
+    if (hd.drop) return false;
+    if (hd.filled) return !!hd.stem;
+    if (hd.stem) return !stemHasFilled.has(hd.stem);
+    return hd.wide;
+  });
+  const used = new Set(goodHeads.filter(hd => hd.stem).map(hd => hd.stem));
+
+  /* ---- Noten bilden (Akkorde über gemeinsamen Hals) ---- */
+  const notes = [];
+  const byStem = new Map();
+  for (const hd of goodHeads) {
+    if (hd.stem) { if (!byStem.has(hd.stem)) byStem.set(hd.stem, []); byStem.get(hd.stem).push(hd); }
+    else {
+      const n = notes.find(nt => !nt.stem && Math.abs(nt.x - hd.x) < 0.7 * S);
+      if (n) n.heads.push(hd); else notes.push({ x: hd.x, heads: [hd], stem: null, dur: hd.breve ? 32 : 16, beamL: 0, beamR: 0 });
+    }
+  }
+  const minRun = Math.max(2, R(0.25 * S));
+  const countCol = (x2, yA, yB) => {
+    x2 = R(x2); if (x2 < 0 || x2 >= w) return 0;
+    let c = 0, y = Math.max(0, R(yA)); const end = Math.min(h - 1, R(yB));
+    while (y <= end) {
+      if (!nb[y * w + x2]) { y++; continue; }
+      const s0 = y; while (y <= end && nb[y * w + x2]) y++;
+      const L = y - s0; if (L >= minRun) c += Math.max(1, R((L + 0.25 * S) / (0.75 * S)));
+    }
+    return c;
+  };
+  const med3 = (a, b2, c) => Math.max(Math.min(a, b2), Math.min(Math.max(a, b2), c));
+  for (const [sg, hs] of byStem) {
+    const up = sg.x > hs.reduce((a, hd) => a + hd.x, 0) / hs.length;
+    const filled = hs.some(hd => hd.filled);
+    let yA, yB;
+    if (up) { yA = sg.y0 - 0.3 * S; yB = Math.min(sg.y0 + 2.4 * S, Math.min(...hs.map(hd => hd.y)) - 0.9 * S); }
+    else { yB = sg.y1 + 0.3 * S; yA = Math.max(sg.y1 - 2.4 * S, Math.max(...hs.map(hd => hd.y)) + 0.9 * S); }
+    const side = dir => { const xs = [0.35, 0.5, 0.65].map(k => dir < 0 ? sg.x0 - 1 - k * S : sg.x1 + 1 + k * S); return med3(...xs.map(xx => countCol(xx, yA, yB))); };
+    const L = filled ? side(-1) : 0, Rr = filled ? side(1) : 0;
+    const beams = Math.min(4, Math.max(L, Rr));
+    const dur = filled ? 4 / Math.pow(2, beams) : 8;
+    notes.push({ x: hs.reduce((a, hd) => a + hd.x, 0) / hs.length, heads: hs, stem: sg, up, dur, beamL: L, beamR: Rr });
+  }
+  notes.sort((a, b2) => a.x - b2.x);
+
+  /* ---- Übrige Symbole: Vorzeichen, Pausen, Punkte ---- */
+  const headLabs = new Set();
+  for (const hd of goodHeads) {
+    for (let yy = R(hd.y - 0.45 * S); yy <= R(hd.y + 0.45 * S); yy += Math.max(1, R(S / 8)))
+      for (let xx = R(hd.x - 0.75 * S); xx <= R(hd.x + 0.75 * S); xx += Math.max(1, R(S / 8))) {
+        if (yy < 0 || yy >= h || xx < 0 || xx >= w) continue;
+        const l = lab[yy * w + xx]; if (l) headLabs.add(l);
+      }
+  }
+  for (const sg of used) { const l = lab[R((sg.y0 + sg.y1) / 2) * w + R(sg.x)]; if (l) headLabs.add(l); }
+  const restC = near.filter(c => !headLabs.has(c.id) && c.x0 >= contentStart - 0.3 * S && c.cy > s.tmin - 2.5 * S && c.cy < s.bmax + 2.5 * S);
+  // Punkte einzeln erkennen (zwei Wiederholungspunkte übereinander sollen nicht zu einem Zeichen verschmelzen)
+  const rests = [], dots = [];
+  const isDot = c => { const cw = (c.x1 - c.x0 + 1) / S, chh = (c.y1 - c.y0 + 1) / S, f = c.n / ((c.x1 - c.x0 + 1) * (c.y1 - c.y0 + 1)); return cw >= 0.15 && cw <= 0.7 && chh >= 0.15 && chh <= 0.7 && f >= 0.5 && Math.abs(cw - chh) < 0.35; };
+  for (const c of restC) if (isDot(c)) dots.push({ x: (c.x0 + c.x1) / 2, y: (c.y0 + c.y1) / 2, r: (c.x1 - c.x0 + 1) / 2 });
+  // Fermaten: flacher Bogen über oder unter einer Note (einzeln, bevor Bruchstücke gruppiert werden)
+  const isFermata = c => {
+    const cw = (c.x1 - c.x0 + 1) / S, chh = (c.y1 - c.y0 + 1) / S, f = c.n / ((c.x1 - c.x0 + 1) * (c.y1 - c.y0 + 1)), cx = (c.x0 + c.x1) / 2, cy = (c.y0 + c.y1) / 2;
+    if (cw < 0.9 || cw > 3.0 || chh < 0.4 || chh > 1.7 || f > 0.5) return false;
+    if (!(cy < s.top(cx) - 0.3 * S || cy > s.bot(cx) + 0.3 * S)) return false;
+    const n = notes.find(nt => Math.abs(nt.x - cx) < 0.9 * S);
+    if (!n) return false;
+    n.fermata = true; res.dbg.boxes.push({ x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1, kind: "fermata", label: "Fermate" });
+    return true;
+  };
+  const glyphs = groupGlyphs(restC.filter(c => !isDot(c) && !isFermata(c)), S);
+  for (const gl of glyphs) {
+    const gw = (gl.x1 - gl.x0 + 1) / S, gh = (gl.y1 - gl.y0 + 1) / S, cx = (gl.x0 + gl.x1) / 2, cy = (gl.y0 + gl.y1) / 2;
+    const gfill = gl.n / ((gl.x1 - gl.x0 + 1) * (gl.y1 - gl.y0 + 1));
+    // Fermate: flacher Bogen über oder unter einer Note
+    if (gw >= 0.9 && gw <= 2.3 && gh >= 0.4 && gh <= 1.3 && gfill < 0.5 && (cy < s.top(cx) - 0.3 * S || cy > s.bot(cx) + 0.3 * S)) {
+      const n = notes.find(nt => Math.abs(nt.x - cx) < 0.6 * S);
+      if (n) { n.fermata = true; res.dbg.boxes.push({ x0: gl.x0, y0: gl.y0, x1: gl.x1, y1: gl.y1, kind: "fermata", label: "Fermate" }); continue; }
+    }
+    const acc = classifyAcc(GT, gl, S);
+    if (acc) {
+      const ay = acc === "flat" ? gl.y1 - 0.45 * S : cy, ap = s.posOf(ay, cx);
+      let tgt = null, td = 1e9;
+      for (const n of notes) for (const hd of n.heads) {
+        const dx = hd.x - gl.x1; if (dx < -0.2 * S || dx > 2.8 * S) continue;
+        const dp = Math.abs(hd.p - ap); if (dp > 1.4) continue;
+        const sc = dx / S + dp; if (sc < td) { td = sc; tgt = hd; }
+      }
+      if (tgt) { if (!tgt.acc) tgt.acc = acc; res.dbg.accs.push({ x0: gl.x0, y0: gl.y0, x1: gl.x1, y1: gl.y1, kind: acc }); continue; }
+    }
+    const rr = classifyRest(GT, gl, s, S);
+    if (ctx.debug) (res.dbg.glyphs = res.dbg.glyphs || []).push({ x: R(cx), w: +gw.toFixed(2), h: +gh.toFixed(2), f: +gfill.toFixed(2), p: +s.posOf(cy, cx).toFixed(1), sl: +GT.slope(gl).toFixed(2), tr: +GT.twoRuns(gl).toFixed(2), acc, rest: rr && rr.kind });
+    if (rr) {
+      if (notes.some(n => n.heads.some(hd => Math.abs(hd.x - cx) < 0.6 * S && Math.abs(hd.y - cy) < 1.2 * S))) continue;
+      rests.push({ x: cx, ...rr, box: { x0: gl.x0, y0: gl.y0, x1: gl.x1, y1: gl.y1 } });
+    }
+  }
+
+  /* ---- Taktstriche ---- */
+  const barSegs = segs.filter(sg => !used.has(sg) && sg.x > contentStart && sg.x <= s.x1 + 0.6 * S &&
+    sg.top <= s.top(sg.x) + 0.6 * S && sg.bot >= s.bot(sg.x) - 0.6 * S && !notes.some(n => Math.abs(n.x - sg.x) < 0.25 * S));
+  barSegs.sort((a, b2) => a.x - b2.x);
+  const bars = [];
+  for (const sg of barSegs) {
+    const last = bars[bars.length - 1];
+    if (last && sg.x0 - last.x1 < 1.0 * S) { last.segs.push(sg); last.x1 = sg.x1; }
+    else bars.push({ x0: sg.x0, x1: sg.x1, segs: [sg] });
+  }
+  const thick = sg => sg.wd >= Math.max(3, 0.3 * S);
+  const dotsUsed = new Set();
+  const repeatDots = (xa, xb) => {
+    const hit = dots.filter(d => d.x >= xa && d.x <= xb && [3, 5].some(p => Math.abs(s.posOf(d.y, d.x) - p) < 0.7));
+    if (hit.length >= 2) { hit.forEach(d => dotsUsed.add(d)); return true; }
+    return false;
+  };
+  for (const br of bars) {
+    const th = br.segs.map(thick), n = br.segs.length;
+    const left = repeatDots(br.x0 - 1.3 * S, br.x0 - 0.1 * S), right = repeatDots(br.x1 + 0.1 * S, br.x1 + 1.3 * S);
+    let kind = "|";
+    if (left && right) kind = ":|:"; else if (left) kind = ":|"; else if (right) kind = "|:";
+    else if (n >= 2 && th[n - 1] && !th[0]) kind = "|]";
+    else if (n >= 2 && th[0] && !th[n - 1]) kind = "[|";
+    else if (n >= 2) kind = "||";
+    else if (th[0] && br.x1 > s.x1 - 1.0 * S) kind = "|]";
+    br.kind = kind; br.x = (br.x0 + br.x1) / 2;
+    res.dbg.bars.push({ x: br.x, y0: s.top(br.x), y1: s.bot(br.x), kind });
+  }
+
+  /* ---- Punkte zu Noten ---- */
+  for (const d of dots) {
+    if (dotsUsed.has(d)) continue;
+    let best = null, bd = 1e9;
+    for (const n of notes) for (const hd of n.heads) {
+      const dx = d.x - hd.x; if (dx < 0.6 * S || dx > 2.2 * S) continue;
+      const dy = Math.abs(d.y - hd.y); if (dy > 0.8 * S) continue;
+      const sc = dx + dy; if (sc < bd) { bd = sc; best = n; }
+    }
+    if (best) { best.dot = true; res.dbg.dots.push({ x: d.x, y: d.y, r: d.r }); }
+  }
+
+  /* ---- Zwei Stimmen in einem System (Choral, Posaunenchor): Hals oben = Stimme 1, Hals unten = Stimme 2 ---- */
+  let pairs = 0;
+  for (let i = 0; i < notes.length; i++) for (let j = i + 1; j < notes.length && notes[j].x - notes[i].x < 0.8 * S; j++)
+    if (notes[i].stem && notes[j].stem && notes[i].up !== notes[j].up) pairs++;
+  const withStem = notes.filter(n => n.stem).length;
+  res.twoVoice = pairs >= 3 && pairs >= 0.25 * withStem / 2;
+  const midY = x2 => (s.top(x2) + s.bot(x2)) / 2;
+  let merged = [];
+  if (res.twoVoice) {
+    for (const n of notes) {
+      if (n.stem) n.v = n.up ? 1 : 2;
+      else {
+        // Ganze/Brevis ohne Hals: obere Köpfe Stimme 1, untere Stimme 2
+        const hs = n.heads.slice().sort((a, b2) => a.y - b2.y);
+        if (hs.length >= 2) { merged.push({ ...n, heads: [hs[0]], v: 1 }); merged.push({ ...n, heads: hs.slice(1), v: 2 }); continue; }
+        n.v = hs[0].y < midY(n.x) ? 1 : 2;
+      }
+      merged.push(n);
+    }
+    for (const r of rests) r.v = r.box && (r.box.y0 + r.box.y1) / 2 < midY(r.x) ? 1 : 2;
+  } else {
+    for (const n of notes) {
+      const prev = merged[merged.length - 1];
+      if (prev && Math.abs(prev.x - n.x) < 0.7 * S && prev.stem !== n.stem) {
+        prev.heads = prev.heads.concat(n.heads); prev.dur = Math.min(prev.dur, n.dur); prev.dot = prev.dot || n.dot; prev.fermata = prev.fermata || n.fermata;
+        prev.beamL = Math.max(prev.beamL, n.beamL); prev.beamR = Math.max(prev.beamR, n.beamR);
+      } else merged.push(n);
+    }
+  }
+
+  for (const n of merged) for (const hd of n.heads) res.dbg.heads.push({ x: hd.x, y: hd.y, filled: hd.filled, acc: hd.acc || null, hole: +(hd.hole || 0).toFixed(3) });
+  for (const r of rests) res.dbg.rests.push({ ...r.box, kind: r.kind });
+
+  const ev = [];
+  for (const n of merged) {
+    const hs = []; const seen = new Set();
+    for (const hd of n.heads.sort((a, b2) => b2.p - a.p)) { if (seen.has(hd.p)) continue; seen.add(hd.p); hs.push({ p: hd.p, acc: hd.acc || null }); }
+    ev.push({ type: "note", x: n.x, heads: hs, dur: n.dur * (n.dot ? 1.5 : 1), beamL: n.beamL, beamR: n.beamR, fermata: !!n.fermata, v: n.v || 1 });
+  }
+  for (const r of rests) ev.push({ type: "rest", x: r.x, dur: r.dur, kind: r.kind, v: r.v || 1 });
+  for (const br of bars) ev.push({ type: "bar", x: br.x, kind: br.kind });
+  ev.sort((a, b2) => a.x - b2.x);
+  res.events = ev;
+  return res;
+}
+
+function classifyAcc(GT, gl, S) {
+  const w = (gl.x1 - gl.x0 + 1) / S, h = (gl.y1 - gl.y0 + 1) / S;
+  if (h < 1.5 || h > 3.9 || w < 0.3 || w > 1.5) return null;
+  const st = GT.strokes(gl, R(1.25 * S));
+  if (st.length >= 2) {
+    const L = st[0], Rr = st[st.length - 1];
+    if ((Rr.x0 + Rr.x1) / 2 - (L.x0 + L.x1) / 2 < 0.2 * S) return null;
+    if (Rr.y0 - L.y0 > 0.45 * S && Rr.y1 - L.y1 > 0.45 * S) return "natural";
+    return w >= 0.55 ? "sharp" : null;
+  }
+  if (st.length === 1) {
+    const sk = st[0], rel = ((sk.x0 + sk.x1) / 2 - gl.x0) / (gl.x1 - gl.x0 + 1);
+    if (rel < 0.4 && w >= 0.4 && w <= 1.1 && h <= 3.1) {
+      const xa = sk.x1 + 1;
+      const lo = GT.fillIn(gl, xa, gl.y1 - 0.9 * S, gl.x1, gl.y1), hi = GT.fillIn(gl, xa, gl.y0, gl.x1, gl.y0 + 0.9 * S);
+      if (lo > hi + 0.08) return "flat";
+    }
+  }
+  return null;
+}
+function classifyRest(GT, gl, s, S) {
+  const w = (gl.x1 - gl.x0 + 1) / S, h = (gl.y1 - gl.y0 + 1) / S, cx = (gl.x0 + gl.x1) / 2, cy = (gl.y0 + gl.y1) / 2;
+  const fl = gl.n / ((gl.x1 - gl.x0 + 1) * (gl.y1 - gl.y0 + 1)), p = s.posOf(cy, cx);
+  if (h <= 0.85 && w >= 0.7 && w <= 2.0 && fl >= 0.6 && p > 1.4 && p < 4.6) return p < 3.0 ? { kind: "whole", dur: 16 } : { kind: "half", dur: 8 };
+  if (w >= 0.4 && w <= 1.5 && h >= 1.1 && h <= 3.9 && p > 0 && p < 8) {
+    const tr = GT.twoRuns(gl);
+    if (h < 2.45) return GT.bottomBias(gl) > 0.6 ? { kind: "quarter", dur: 4 } : { kind: "eighth", dur: 2 };
+    if (tr < 0.18 && h < 3.05) return { kind: "quarter", dur: 4 };
+    return h < 3.6 ? { kind: "16th", dur: 1 } : { kind: "32nd", dur: 0.5 };
+  }
+  return null;
+}
+
+/* ================= ABC erzeugen ================= */
+const TOP = { treble: 38, bass: 26, alto: 32, tenor: 30, alto1: 36, alto2: 34, bass3: 28 };
+const CLEF_NAMES = { treble: "Violinschlüssel", bass: "Bassschlüssel", alto: "Altschlüssel", tenor: "Tenorschlüssel", alto1: "Sopranschlüssel", alto2: "Mezzosopranschlüssel", bass3: "Baritonschlüssel" };
+const ACC = { sharp: "^", flat: "_", natural: "=" };
+const SHARP_KEYS = ["C", "G", "D", "A", "E", "B", "F#", "C#"], FLAT_KEYS = ["C", "F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb"];
+const SHARP_MIN = ["A", "E", "B", "F#", "C#", "G#", "D#", "A#"], FLAT_MIN = ["A", "D", "G", "C", "F", "Bb", "Eb", "Ab"];
+function abcPitch(d) {
+  const L = "CDEFGAB"[((d % 7) + 7) % 7], o = Math.floor(d / 7);
+  return o >= 5 ? L.toLowerCase() + "'".repeat(o - 5) : L + ",".repeat(Math.max(0, 4 - o));
+}
+function gcd(a, b) { return b ? gcd(b, a % b) : a; }
+function lenStr(n16) {
+  const k = R(n16 * 4); if (k === 4) return "";
+  const g = gcd(k, 4), num = k / g, den = 4 / g;
+  return den === 1 ? String(num) : (num === 1 ? "/" + den : num + "/" + den);
+}
+function buildAbc(pages, opts) {
+  opts = opts || {};
+  const systems = [];
+  pages.forEach(pg => (pg.systems || []).forEach(sys => systems.push(sys.map(i => pg.staves[i]))));
+  const report = { staves: 0, systems: systems.length, notes: 0, rests: 0, measures: 0, bad: 0, ts: "", tsSource: "", key: "" };
+  if (!systems.length) return { abc: "", report };
+  const nv = Math.max(...systems.map(s => s.length));
+  const clefs = [];
+  for (let v = 0; v < nv; v++) {
+    const f = systems.find(s => s[v] && s[v].clef);
+    clefs.push(f ? f[v].clef : (nv === 2 && v === 1 ? "bass" : "treble"));
+  }
+  const votes = {};
+  systems.forEach(s => s.forEach(st => { report.staves++; const k = st.sharps >= st.flats ? st.sharps : -st.flats; votes[k] = (votes[k] || 0) + 1; }));
+  const keyN = +Object.keys(votes).sort((a, b) => votes[b] - votes[a] || Math.abs(a) - Math.abs(b))[0];
+  // Taktmaße aus der obersten Stimme
+  const sums = []; let acc = 0, any = false; const flatEv = [];
+  systems.forEach(s => { if (s[0]) s[0].events.forEach(e => { if (e.type === "bar" || (e.v || 1) === 1) flatEv.push(e); }); });
+  for (const e of flatEv) {
+    if (e.type === "bar") { if (any) sums.push(acc); acc = 0; any = false; }
+    else { acc += e.dur; any = true; }
+  }
+  if (any) sums.push(acc);
+  const cnt = {}; sums.forEach(v => { cnt[v] = (cnt[v] || 0) + 1; });
+  const modeV = +Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0] || 16;
+  const modeShare = sums.length ? (cnt[modeV] || 0) / sums.length : 0;
+  let tsFound = null;
+  for (const s of systems) for (const st of s) if (st.ts && !tsFound) tsFound = st.ts;
+  let num = 4, den = 4;
+  const fromLen = L => ({ 16: [4, 4], 12: [3, 4], 8: [2, 4], 6: [3, 8], 24: [6, 4], 20: [5, 4], 4: [2, 8], 18: [9, 8], 28: [7, 4] })[L];
+  if (tsFound && (tsFound.num * 16 / tsFound.den === modeV || modeShare < 0.4)) { num = tsFound.num; den = tsFound.den; report.tsSource = "erkannt"; }
+  else if (modeShare >= 0.4 && fromLen(modeV)) {
+    [num, den] = fromLen(modeV); report.tsSource = "aus den Takten geschätzt";
+    if (modeV === 12) {
+      // 6/8 statt 3/4, wenn Achtel überwiegend in Dreiergruppen gebalkt sind
+      let g3 = 0, g2 = 0, run = 0;
+      for (const e of flatEv) { if (e.type === "note" && e.dur === 2) { run++; if (!(e.beamR > 0)) { if (run === 3) g3++; else if (run === 2 || run === 4) g2++; run = 0; } } else run = 0; }
+      if (g3 > g2) { num = 6; den = 8; }
+    }
+  } else if (tsFound) { num = tsFound.num; den = tsFound.den; report.tsSource = "erkannt"; }
+  else report.tsSource = "Standard";
+  if (tsFound && tsFound.common && num === 4 && den === 4) report.common = true;
+  const measure16 = num * 16 / den;
+  report.ts = num + "/" + den;
+  report.measures = sums.length;
+  report.bad = sums.filter((v, i) => v !== measure16 && i !== 0 && i !== sums.length - 1).length;
+
+  // Moll? Schlusston der untersten Stimme
+  let minor = false;
+  const lastSys = systems[systems.length - 1], lowSt = lastSys[lastSys.length - 1];
+  const lastNote = lowSt && [...lowSt.events].reverse().find(e => e.type === "note");
+  if (lastNote) {
+    const vIdx = lastSys.length - 1, clef = lowSt.clef || clefs[vIdx] || "treble";
+    const d = TOP[clef] - lastNote.heads[0].p, letter = "CDEFGAB"[((d % 7) + 7) % 7];
+    const mt = (keyN >= 0 ? SHARP_MIN[keyN] : FLAT_MIN[-keyN]) || "A";
+    if (mt[0] === letter) minor = true;
+  }
+  const key = minor ? (keyN >= 0 ? SHARP_MIN[keyN] : FLAT_MIN[-keyN]) + "m" : (keyN >= 0 ? SHARP_KEYS[keyN] : FLAT_KEYS[-keyN]);
+  report.key = key;
+
+  const staffAbc = (st, clef) => {
+    const top = TOP[clef] || 38;
+    // ganze Pausen allein im Takt als Taktpause
+    const evs = st.events.map(e => ({ ...e }));
+    let start = 0;
+    for (let i = 0; i <= evs.length; i++) {
+      if (i === evs.length || evs[i].type === "bar") {
+        const inner = evs.slice(start, i);
+        if (inner.length === 1 && inner[0].type === "rest" && inner[0].kind === "whole") inner[0].full = true;
+        start = i + 1;
+      }
+    }
+    const tokens = list => {
+      let o = "", prev = null;
+      for (const e of list) {
+        let tok;
+        if (e.type === "rest") { tok = e.full ? "Z" : "z" + lenStr(e.dur); report.rests++; }
+        else {
+          const ps = [...new Set(e.heads.map(hd => (hd.acc ? ACC[hd.acc] : "") + abcPitch(top - hd.p)))];
+          tok = (e.fermata ? "!fermata!" : "") + (ps.length > 1 ? "[" + ps.join("") + "]" : ps[0]) + lenStr(e.dur);
+          report.notes++;
+        }
+        const join = prev && e.type === "note" && prev.beamR > 0 && e.beamL > 0 && prev.dur < 4 && e.dur < 4;
+        o += (join ? "" : " ") + tok;
+        prev = e.type === "note" ? e : null;
+      }
+      return o.trim();
+    };
+    let out = "", meas = [];
+    const flush = () => {
+      if (!meas.length) return;
+      const v1 = meas.filter(e => (e.v || 1) === 1), v2 = meas.filter(e => e.v === 2);
+      out += " " + tokens(v1) + (st.twoVoice && v2.length ? " & " + tokens(v2) : "");
+      meas = [];
+    };
+    for (const e of evs) {
+      if (e.type === "bar") { flush(); out += " " + e.kind + " "; continue; }
+      meas.push(e);
+    }
+    flush();
+    out = out.replace(/\s+/g, " ").trim();
+    if (!out) out = "x" + lenStr(measure16);
+    if (!/(\||\]|:)$/.test(out)) out += " |";
+    return out;
+  };
+  const head = ["X:1", "T:" + (opts.title || "Gescannte Noten"), "M:" + (report.common ? "C" : num + "/" + den), "L:1/16", "Q:1/4=" + (opts.bpm || 100)];
+  if (nv > 1) {
+    for (let v = 0; v < nv; v++) head.push(`V:${v + 1} clef=${clefs[v]}`);
+    if (nv === 2 && clefs[0] === "treble" && clefs[1] === "bass") head.push("%%score {1 2}");
+    head.push("K:" + key);
+  } else head.push("K:" + key + (clefs[0] !== "treble" ? " clef=" + clefs[0] : ""));
+  const body = [];
+  for (const s of systems) {
+    s.forEach((st, j) => {
+      const clef = st.clef || clefs[j];
+      body.push((nv > 1 ? `[V:${j + 1}] ` : "") + staffAbc(st, clef));
+    });
+  }
+  // Schlussstrich
+  for (let v = nv - 1; v >= 0; v--) {
+    for (let i = body.length - 1; i >= 0; i--) {
+      if (nv > 1 && !body[i].startsWith(`[V:${v + 1}]`)) continue;
+      if (!/\|\]$|:\|$/.test(body[i])) body[i] = body[i].replace(/\|+$/, "").trimEnd() + " |]";
+      break;
+    }
+  }
+  return { abc: head.concat(body).join("\n"), report };
+}
+
+return { processPage, buildAbc, zoneFeatures, tightBox };
+})();
+</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/abcjs/6.4.4/abcjs-basic-min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script>
@@ -403,7 +1604,6 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 /* ---------- Platform capabilities (Claude artifact) ---------- */
 const CL = window.claude;
 const inArtifact = !!(CL && typeof CL.use === "function");
-const sampleP = inArtifact ? CL.use("sample").catch(() => null) : Promise.resolve(null);
 const downloadsP = inArtifact ? CL.use("downloads").catch(() => null) : Promise.resolve(null);
 
 /* ---------- Demo piece (public domain) ---------- */
@@ -857,62 +2057,81 @@ $("#photoGrid").addEventListener("click", e => {
 $("#camIn").addEventListener("change", e => { addFiles(e.target.files); e.target.value = ""; });
 $("#galIn").addEventListener("change", e => { addFiles(e.target.files); e.target.value = ""; });
 
-async function prepImage(p) {
-  // Apply rotation and cap the size; the photo stays sharp enough to read noteheads.
+/* ---------- Notenerkennung im Browser (Web Worker) ---------- */
+const ENGINE_SRC = $("#omr-engine").textContent;
+const OMR = new Function(ENGINE_SRC + "\nreturn OMR;")();
+const WORKER_GLUE = `
+self.onmessage = function (e) {
+  var d = e.data;
+  try {
+    var r = OMR.processPage(new Uint8ClampedArray(d.buf), d.w, d.h, d.opts, function (msg, f) { self.postMessage({ id: d.id, progress: f, msg: msg }); });
+    self.postMessage({ id: d.id, result: r });
+  } catch (err) { self.postMessage({ id: d.id, error: String(err && err.stack || err) }); }
+};`;
+let worker = null, workerBroken = false;
+function getWorker() {
+  if (worker || workerBroken) return worker;
+  try { worker = new Worker(URL.createObjectURL(new Blob([ENGINE_SRC, WORKER_GLUE], { type: "text/javascript" }))); }
+  catch (e) { workerBroken = true; worker = null; }
+  return worker;
+}
+function stopWorker() { if (worker) { worker.terminate(); worker = null; } }
+function runOnMain(img, opts, onProgress) {
+  return new Promise((res, rej) => setTimeout(() => { try { res(OMR.processPage(img.data, img.width, img.height, opts, onProgress)); } catch (e) { rej(e); } }, 30));
+}
+function runPage(img, opts, onProgress, signal) {
+  const wk = getWorker();
+  if (!wk) return runOnMain(img, opts, onProgress);
+  return new Promise((res, rej) => {
+    const id = Math.random();
+    let answered = false;
+    const onMsg = e => {
+      if (e.data.id !== id) return;
+      answered = true;
+      if (e.data.progress != null) { onProgress(e.data.msg, e.data.progress); return; }
+      cleanup();
+      if (e.data.error) rej(new Error(e.data.error)); else res(e.data.result);
+    };
+    const onErr = () => {
+      cleanup();
+      if (!answered) { workerBroken = true; stopWorker(); runOnMain(img, opts, onProgress).then(res, rej); }
+      else rej(new Error("worker"));
+    };
+    const onAbort = () => { cleanup(); stopWorker(); rej({ code: "cancelled" }); };
+    const cleanup = () => { wk.removeEventListener("message", onMsg); wk.removeEventListener("error", onErr); signal && signal.removeEventListener("abort", onAbort); };
+    wk.addEventListener("message", onMsg); wk.addEventListener("error", onErr);
+    signal && signal.addEventListener("abort", onAbort);
+    // Kopie senden, damit das Bild für die Vorschau erhalten bleibt
+    const buf = img.data.buffer.slice(0);
+    wk.postMessage({ id, buf, w: img.width, h: img.height, opts }, [buf]);
+  });
+}
+// Vorlagen für Ziffern und C der Taktart, aus Systemschriften erzeugt
+let TEMPLATES = null;
+function digitTemplates() {
+  if (TEMPLATES) return TEMPLATES;
+  const out = [], fonts = ['bold 120px Georgia, serif', 'bold 120px "Times New Roman", Times, serif', 'bold 120px serif', '900 120px "Palatino Linotype", Palatino, serif'];
+  for (const font of fonts) for (const ch of ["1", "2", "3", "4", "5", "6", "7", "8", "9", "C"]) {
+    const c = document.createElement("canvas"); c.width = 180; c.height = 180;
+    const x = c.getContext("2d");
+    x.fillStyle = "#fff"; x.fillRect(0, 0, 180, 180); x.fillStyle = "#000"; x.font = font; x.textAlign = "center"; x.textBaseline = "middle"; x.fillText(ch, 90, 95);
+    const d = x.getImageData(0, 0, 180, 180).data, get = (xx, yy) => d[(yy * 180 + xx) * 4] < 128;
+    const tb = OMR.tightBox(get, 0, 0, 179, 179); if (!tb) continue;
+    out.push({ ch, f: OMR.zoneFeatures(get, tb.x0, tb.y0, tb.x1, tb.y1) });
+  }
+  return (TEMPLATES = out);
+}
+async function prepImage(p, max) {
+  // Drehung anwenden und Größe begrenzen
   let bmp;
   try { bmp = await createImageBitmap(p.file, { imageOrientation: "from-image" }); }
-  catch (e) {
-    bmp = await new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = rej; im.src = p.url; });
-  }
-  const w0 = bmp.width, h0 = bmp.height, max = 2400, s = Math.min(1, max / Math.max(w0, h0));
+  catch (e) { bmp = await new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = rej; im.src = p.url; }); }
+  const w0 = bmp.width, h0 = bmp.height, s = Math.min(1, max / Math.max(w0, h0));
   const w = Math.round(w0 * s), h = Math.round(h0 * s), r = p.rot % 360, swap = r === 90 || r === 270;
   const c = document.createElement("canvas"); c.width = swap ? h : w; c.height = swap ? w : h;
   const x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, c.width, c.height);
   x.translate(c.width / 2, c.height / 2); x.rotate(r * Math.PI / 180); x.drawImage(bmp, -w / 2, -h / 2, w, h);
-  return await new Promise(res => c.toBlob(res, "image/jpeg", 0.9));
-}
-
-const OMR_PROMPT = n => `You are an expert music copyist performing optical music recognition (OMR).
-${n > 1 ? `The ${n} attached images are photos of sheet music in page order (image 1 is the first page). Together they form ONE continuous piece.` : "The attached image is a photo of sheet music."}
-
-Transcribe the music as exactly as possible into ABC notation (standard 2.1, rendered with abcjs).
-
-Header, in this order:
-X:1
-T: the title as printed (otherwise "Unbenannt")
-C: composer or arranger if printed
-M: the time signature as printed
-L: a sensible default note length (usually 1/8)
-Q: only if a metronome mark is printed, e.g. Q:1/4=96
-V: lines when there is more than one staff (see below)
-K: the key signature exactly as printed; decide major or minor from the music (e.g. K:Em). Use K:C when there are no accidentals in the key signature.
-
-Body rules:
-- One ABC line per printed system, so line breaks match the page.
-- Several simultaneous staves (piano grand staff, choir, ensemble): declare each staff before K: as its own voice, e.g. V:1 clef=treble name="Rechte Hand" and V:2 clef=bass name="Linke Hand", plus %%score {1 2} for a piano brace. Then write the music system by system, starting each ABC line with [V:1], [V:2] and so on.
-- Read every pitch through the clef. In ABC, C is middle C (C4), c is C5, C, is C3, c' is C6.
-- The key signature applies implicitly. Write accidentals only where printed (^ sharp, _ flat, = natural); they last until the barline.
-- Each bar must add up to the time signature (pickup bars excepted). Rests are z. Notes on one stem form a chord in square brackets like [CEG]. Two independent rhythms in one staff use & inside the bar.
-- Keep ties (-), slurs ( ), tuplets like (3, dotted rhythms (> or explicit lengths), grace notes {}, fermatas !fermata!, dynamics (!p! !mf! !f! !crescendo(! !crescendo)!), staccato (.), repeats (|: :|), first and second endings ([1 [2), and inline changes of key, meter or clef ([K:...] [M:...]).
-- Chord symbols printed above the staff go in double quotes before the note, e.g. "Am7". Do not invent chord symbols.
-- Lyrics printed under a staff go into a w: line right after that ABC line.
-- Where a passage is unreadable, write rests of the correct length instead of guessing.
-
-Answer format: exactly one fenced code block that starts with \`\`\`abc and holds the complete ABC, followed by one line starting with "HINWEISE:" with at most three short notes in German about uncertain spots (or "keine"). No other text.`;
-
-function extractAbc(text) {
-  const fence = text.match(/```(?:abc)?[^\n]*\n([\s\S]*?)```/i);
-  let abc = fence ? fence[1] : text;
-  if (!fence) {
-    abc = abc.split(/\n\s*HINWEISE:/i)[0];
-    const i = abc.search(/^X:/m); if (i > 0) abc = abc.slice(i);
-  }
-  abc = abc.replace(/```/g, "").trim();
-  if (!/^X:/m.test(abc)) abc = "X:1\n" + abc;
-  const h = text.match(/HINWEISE:\s*([\s\S]*)$/i);
-  let notes = h ? h[1].replace(/```/g, "").trim() : "";
-  if (/^keine\.?$/i.test(notes)) notes = "";
-  return { abc, notes };
+  return c;
 }
 
 let ocrCtl = null, ocrTick = null;
@@ -921,17 +2140,9 @@ function setPhase(n, txt) {
   $("#ocrPhase").textContent = txt;
 }
 async function recognize() {
-  const sample = await sampleP;
-  if (!sample) { showNoOcr(); return; }
-  let limits = null;
-  try { limits = await sample.limits(); } catch (e) {}
-  if (!limits || !limits.images) { showNoOcr(); return; }
-  if (S.photos.length > limits.images.maxCount) {
-    toast(`Höchstens ${limits.images.maxCount} Fotos auf einmal. Bitte entferne ${S.photos.length - limits.images.maxCount}.`, 4000); return;
-  }
-  const panel = $("#ocrPanel"), live = $("#ocrLive"), err = $("#ocrErr");
-  panel.hidden = false; err.hidden = true; live.textContent = ""; $("#ocrSpin").hidden = false;
-  $("#ocrStatus").textContent = "Claude liest die Noten …";
+  const panel = $("#ocrPanel"), err = $("#ocrErr");
+  panel.hidden = false; err.hidden = true; $("#ocrSpin").hidden = false;
+  $("#ocrStatus").textContent = "Noten werden erkannt …";
   setPhase(1, "Fotos werden vorbereitet.");
   panel.scrollIntoView({ behavior: "smooth", block: "center" });
   busy(true);
@@ -939,60 +2150,92 @@ async function recognize() {
   clearInterval(ocrTick);
   ocrTick = setInterval(() => { const s = Math.floor((Date.now() - t0) / 1000); $("#ocrTime").textContent = Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); }, 500);
   ocrCtl = new AbortController();
-  const myCtl = ocrCtl;
+  const myCtl = ocrCtl, n = S.photos.length, pages = [];
   try {
-    const blobs = [];
-    for (const p of S.photos) blobs.push(await prepImage(p));
-    if (myCtl.signal.aborted) throw { code: "cancelled" };
-    setPhase(2, "Claude erkennt Notenlinien, Schlüssel, Tonart und Rhythmus. Das dauert meist 30 bis 90 Sekunden.");
-    let started = false;
-    const res = await sample(OMR_PROMPT(blobs.length), {
-      images: blobs, modelTier: "complex", signal: myCtl.signal,
-      onText: ({ text }) => {
-        if (!started) { started = true; setPhase(3, "Noten werden geschrieben …"); }
-        live.textContent = text.slice(-1400); live.scrollTop = live.scrollHeight;
-      }
-    });
-    setPhase(4, "Fertig. Noten werden geprüft.");
-    const { abc, notes } = extractAbc(res.text);
-    S.abc = abc; S.source = "scan"; S.ocrNotes = notes + (res.truncated ? (notes ? "\n" : "") + "Die Antwort wurde gekürzt; das Ende des Stücks fehlt eventuell." : "");
+    const templates = digitTemplates();
+    for (let i = 0; i < n; i++) {
+      if (myCtl.signal.aborted) throw { code: "cancelled" };
+      const pre = `Seite ${i + 1} von ${n}: `;
+      setPhase(1 + Math.round(3 * i / n), pre + "Foto wird vorbereitet.");
+      const cv = await prepImage(S.photos[i], 2600);
+      const img = cv.getContext("2d").getImageData(0, 0, cv.width, cv.height);
+      const res = await runPage(img, { templates }, (msg, f) => setPhase(1 + Math.round(3 * (i + f) / n), pre + msg + "."), myCtl.signal);
+      // kleine Vorschau für die Anzeige der Erkennung
+      const k = Math.min(1, 1400 / Math.max(cv.width, cv.height));
+      const pv = document.createElement("canvas"); pv.width = Math.round(cv.width * k); pv.height = Math.round(cv.height * k);
+      pv.getContext("2d").drawImage(cv, 0, 0, pv.width, pv.height);
+      pages.push({ res, preview: pv, srcW: cv.width, srcH: cv.height });
+    }
+    setPhase(4, "Notentext wird zusammengesetzt.");
+    const title = $("#titleIn").value.trim() || (n === 1 ? "Gescannte Noten" : `Gescannte Noten (${n} Seiten)`);
+    const { abc, report } = OMR.buildAbc(pages.map(p => p.res), { title });
+    const warn = pages.flatMap(p => p.res.warnings || []);
+    if (!abc || !report.staves) {
+      throw { code: "nostaff", message: warn[0] || "Auf den Fotos wurden keine Notenlinien gefunden." };
+    }
+    S.scan = { pages, report, warnings: warn };
+    S.abc = abc; S.source = "scan";
+    S.ocrNotes = scanSummary(report, warn);
     S.tr.target = null; S.tr.preset = null; S.tr.oct = 0;
     save(); updateCurrent();
     panel.hidden = true;
-    if (!parseOk(abc)) toast("Erkennung unvollständig. Bitte den Notentext prüfen.", 4000);
-    else toast("Noten erkannt. Bitte kurz prüfen und anhören.");
+    toast(`${report.notes} Noten erkannt. Bitte kurz prüfen und anhören.`, 3500);
     goStep(2);
     if (!parseOk(abc)) $("#editBox").open = true;
   } catch (e) {
-    const code = e && e.code;
     $("#ocrSpin").hidden = true;
-    if (code === "cancelled") { panel.hidden = true; toast("Erkennung abgebrochen."); }
+    if (e && e.code === "cancelled") { panel.hidden = true; toast("Erkennung abgebrochen."); }
     else {
-      const msg = {
-        not_granted: "Die App darf Claude nicht verwenden. Erlaube den Zugriff in den Berechtigungen des Artifacts, oder füge Noten als Text ein.",
-        sampling_disabled: "Claude ist für dieses Konto hier nicht verfügbar.",
-        rate_limited: "Gerade zu viele Anfragen. Bitte in ein paar Minuten noch einmal versuchen.",
-        session_expired: "Bitte melde dich bei Claude neu an und versuche es dann erneut.",
-        image_rejected: "Ein Foto konnte nicht gelesen werden. Nimm es neu auf oder entferne es.",
-        images_unavailable: "Fotos können in dieser Ansicht nicht an Claude gesendet werden.",
-        refused: "Claude konnte in den Fotos keine Noten erkennen. Versuche schärfere, gerade Fotos.",
-        empty_completion: "Claude konnte in den Fotos keine Noten erkennen. Versuche schärfere, gerade Fotos."
-      }[code] || "Die Erkennung ist unterbrochen. Bitte erneut versuchen.";
+      console.error(e);
       $("#ocrStatus").textContent = "Erkennung fehlgeschlagen";
-      err.textContent = msg; err.hidden = false;
+      err.textContent = (e && e.code === "nostaff" ? e.message : "Beim Lesen der Fotos ist ein Fehler aufgetreten.") + " Tipp: Seite gerade, formatfüllend und hell fotografieren, oder kleinere Ausschnitte aufnehmen.";
+      err.hidden = false;
     }
   } finally {
-    clearInterval(ocrTick); ocrCtl = null; busy(false);
+    clearInterval(ocrTick); ocrCtl = null; busy(false); updateBar();
   }
+}
+function scanSummary(rep, warn) {
+  const parts = [`${rep.staves} Notenzeilen, ${rep.notes} Noten, ${rep.rests} Pausen`];
+  parts.push(`Taktart ${rep.ts} (${rep.tsSource}), Tonart ${rep.key}`);
+  if (rep.measures > 2) parts.push(rep.bad ? `${rep.bad} von ${rep.measures} Takten passen rechnerisch nicht zur Taktart, dort lohnt sich ein Blick` : "Alle Takte gehen rechnerisch auf");
+  return parts.join(". ") + "." + (warn.length ? " " + warn[0] : "");
 }
 $("#ocrStop").addEventListener("click", () => { if (ocrCtl) ocrCtl.abort(); else $("#ocrPanel").hidden = true; });
 function busy(on) { $("#nextBtn").disabled = on; $("#backBtn").disabled = on; $$(".stepper button").forEach(b => b.disabled = on || b.dataset.locked === "1"); }
-async function showNoOcr() {
-  const n = $("#noOcr");
-  n.innerHTML = inArtifact
-    ? "<strong>Automatische Notenerkennung ist hier nicht verfügbar.</strong> Füge die Noten als ABC-Text ein oder nutze das Beispiel."
-    : "<strong>Die Notenerkennung braucht Claude.</strong> Öffne diese Seite über den Claude-Link, dann werden Fotos automatisch in Noten umgewandelt. Hier kannst du Noten als ABC-Text einfügen.";
-  n.hidden = false; $("#pasteBox").open = true; n.scrollIntoView({ behavior: "smooth", block: "center" });
+
+/* ---------- Erkennung auf dem Foto zeigen ---------- */
+function drawScan() {
+  const box = $("#scanBox"), host = $("#scanPages");
+  if (!S.scan || S.source !== "scan") { box.hidden = true; return; }
+  box.hidden = false; host.innerHTML = "";
+  S.scan.pages.forEach((pg, i) => {
+    const r = pg.res, k = Math.min(1, 1100 / r.w);
+    const c = document.createElement("canvas"); c.width = Math.round(r.w * k); c.height = Math.round(r.h * k);
+    const x = c.getContext("2d");
+    x.fillStyle = "#fff"; x.fillRect(0, 0, c.width, c.height);
+    x.save(); x.scale(k, k); x.translate(r.w / 2, r.h / 2); x.rotate(-r.angle * Math.PI / 180);
+    x.globalAlpha = 0.55; x.drawImage(pg.preview, -r.w / 2, -r.h / 2, r.w, r.h); x.restore();
+    x.save(); x.scale(k, k);
+    const lw = Math.max(1.5, 1.2 / k);
+    for (const st of r.staves) {
+      x.strokeStyle = "rgba(43,107,255,.75)"; x.lineWidth = lw;
+      st.lines.forEach(l => { x.beginPath(); l.forEach(([a, b], j) => j ? x.lineTo(a, b) : x.moveTo(a, b)); x.stroke(); });
+      x.lineWidth = lw * 1.6;
+      st.dbg.bars.forEach(b => { x.strokeStyle = "#7B3FE4"; x.beginPath(); x.moveTo(b.x, b.y0 - st.S * 0.4); x.lineTo(b.x, b.y1 + st.S * 0.4); x.stroke(); });
+      st.dbg.boxes.forEach(b => { x.strokeStyle = "#0B8F8F"; x.strokeRect(b.x0 - 2, b.y0 - 2, b.x1 - b.x0 + 4, b.y1 - b.y0 + 4); });
+      st.dbg.rests.forEach(b => { x.strokeStyle = "#F08C00"; x.strokeRect(b.x0 - 2, b.y0 - 2, b.x1 - b.x0 + 4, b.y1 - b.y0 + 4); });
+      st.dbg.accs.forEach(b => { x.strokeStyle = "#E03131"; x.strokeRect(b.x0 - 2, b.y0 - 2, b.x1 - b.x0 + 4, b.y1 - b.y0 + 4); });
+      st.dbg.heads.forEach(hd => { x.strokeStyle = hd.filled ? "#11A35B" : "#D61F69"; x.beginPath(); x.ellipse(hd.x, hd.y, st.S * 0.75, st.S * 0.6, 0, 0, 7); x.stroke(); });
+    }
+    x.restore();
+    const fig = document.createElement("figure");
+    const cap = document.createElement("figcaption");
+    cap.textContent = `Seite ${i + 1}: ${r.staves.length} Notenzeilen · Tippen zum Vergrößern` + (r.warnings && r.warnings.length ? ` · ${r.warnings[0]}` : "");
+    const wrap = document.createElement("div"); wrap.className = "zoomwrap"; wrap.appendChild(c);
+    c.addEventListener("click", () => wrap.classList.toggle("zoom"));
+    fig.append(wrap, cap); host.appendChild(fig);
+  });
 }
 
 function updateCurrent() {
@@ -1263,11 +2506,12 @@ function goStep(n) {
     const notes = $("#ocrNotes");
     if (S.source === "scan") {
       notes.hidden = false;
-      notes.innerHTML = "<strong>Aus Fotos erkannt.</strong> Hör es dir an und vergleiche mit dem Blatt. Fehler korrigierst du unten im Notentext." + (S.ocrNotes ? "<br><span class='small'>Hinweise: " + escapeHTML(S.ocrNotes) + "</span>" : "");
+      notes.innerHTML = "<strong>Aus Fotos erkannt.</strong> Hör es dir an und vergleiche mit dem Blatt. Unter „Erkennung auf den Fotos ansehen“ siehst du, was gelesen wurde; Fehler korrigierst du im Notentext." + (S.ocrNotes ? "<br><span class='small'>" + escapeHTML(S.ocrNotes) + "</span>" : "");
     } else if (S.source === "demo") {
       notes.hidden = false; notes.innerHTML = "<strong>Beispielstück.</strong> Nimm im ersten Schritt deine eigenen Noten auf.";
     } else notes.hidden = true;
     buildKeyGrid(); buildPresets(); syncTransposeUI();
+    drawScan();
   }
   if (n === 3) { if (!S.vOrig) renderOrig(); if (!buildTransposed()) { goStep(2); return; } }
   updateBar(); syncPlayers();
@@ -1303,7 +2547,6 @@ buildPlayer($("#player-orig"), "orig");
 buildPlayer($("#player-tr"), "tr");
 renderPhotos(); updateCurrent(); goStep(1);
 if (!window.ABCJS) toast("Notenbibliothek konnte nicht geladen werden. Bitte Internetverbindung prüfen.", 6000);
-sampleP.then(s => { if (!s && !inArtifact) { /* standalone file: recognition needs Claude */ } });
 document.addEventListener("visibilitychange", () => { if (document.hidden) stopPlayback(); });
 })();
 </script>
