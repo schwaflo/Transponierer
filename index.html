@@ -342,6 +342,8 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
               <span><i style="background:#0B8F8F"></i>Schlüssel, Tonart, Takt, Klammern 1./2., Fine/D.C.</span>
             </p>
             <div id="scanPages" class="scan-pages"></div>
+            <div class="row-btns"><button type="button" id="diagBtn" class="btn ghost sm">Details für die Fehlersuche kopieren</button></div>
+            <textarea id="diagOut" readonly hidden aria-label="Details für die Fehlersuche"></textarea>
           </div>
         </details>
         <details class="more" id="editBox">
@@ -2152,9 +2154,30 @@ const Synth = (() => {
   let ctx = null, bus = null, prevBus = null, timer = null, tc = null, noise = null;
   const waves = {}, ksCache = {};
   const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  // iPhone: Web-Audio ist sonst stumm, wenn der Lautlos-Schalter aktiv ist. Als Musikwiedergabe anmelden
+  // und eine stumme Audiospur mitlaufen lassen (muss direkt im Tipp-Ereignis passieren).
+  let silentEl = null;
+  function silentWavUrl() {
+    const n = 4000, buf = new ArrayBuffer(44 + n), v = new DataView(buf), w = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+    w(0, "RIFF"); v.setUint32(4, 36 + n, true); w(8, "WAVE"); w(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, 8000, true); v.setUint32(28, 8000, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true); w(36, "data"); v.setUint32(40, n, true);
+    for (let i = 0; i < n; i++) v.setUint8(44 + i, 128);
+    let bin = ""; const u8 = new Uint8Array(buf); for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+    return "data:audio/wav;base64," + btoa(bin);
+  }
+  function unlockIOS() {
+    try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
+    try {
+      if (!silentEl) { silentEl = document.createElement("audio"); silentEl.src = silentWavUrl(); silentEl.loop = true; silentEl.setAttribute("playsinline", ""); silentEl.preload = "auto"; }
+      const p = silentEl.play(); if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+  }
   function ensure() {
+    unlockIOS();
     if (!ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null; ctx = new AC(); }
     if (ctx.state !== "running") ctx.resume().catch(() => {});
+    // ein kurzer stummer Ton „weckt“ den Audiokontext auf iOS zuverlässig
+    try { const b = ctx.createBuffer(1, 1, 22050), src = ctx.createBufferSource(); src.buffer = b; src.connect(ctx.destination); src.start(0); } catch (e) {}
     return ctx;
   }
   function mkBus(level = 0.6) {
@@ -2258,6 +2281,7 @@ const Synth = (() => {
     }}
   };
   function stop() {
+    try { if (silentEl) silentEl.pause(); } catch (e) {}
     clearInterval(timer); timer = null;
     if (tc) { try { tc.stop(); } catch (e) {} tc = null; }
     if (bus && ctx) {
@@ -2781,6 +2805,23 @@ function scanSummary(rep, warn) {
 }
 $("#ocrStop").addEventListener("click", () => { if (ocrCtl) ocrCtl.abort(); else $("#ocrPanel").hidden = true; });
 function busy(on) { $("#nextBtn").disabled = on; $("#backBtn").disabled = on; $$(".stepper button").forEach(b => b.disabled = on || b.dataset.locked === "1"); }
+
+/* ---------- Details für die Fehlersuche ---------- */
+$("#diagBtn").addEventListener("click", async () => {
+  if (!S.scan) return;
+  const L = ["Transponierer Diagnose " + new Date().toISOString(), "Browser: " + navigator.userAgent];
+  S.scan.pages.forEach((pg, i) => {
+    const r = pg.res;
+    L.push(`Seite ${i + 1}: Foto ${pg.srcW}x${pg.srcH}, Verarbeitung ${r.w}x${r.h}, Maßstab ${(+r.scale).toFixed(2)}, Linienabstand ${(+r.S).toFixed(1)}, Liniendicke ${r.T}, Drehung ${(+r.angle).toFixed(2)}°, Systeme ${(r.systems || []).map(sy => sy.length).join("+")}`);
+    (r.staves || []).forEach((st, j) => L.push(`  Zeile ${j + 1}: x ${st.x0}-${st.x1}, Schlüssel ${st.clef || "-"}, Kreuze ${st.sharps}, Bs ${st.flats}, Takt ${st.ts ? st.ts.num + "/" + st.ts.den : "-"}, Köpfe ${st.dbg.heads.length}, Taktstriche ${st.dbg.bars.length}, Pausen ${st.dbg.rests.length}${st.twoVoice ? ", zweistimmig" : ""}`));
+    (r.warnings || []).forEach(w => L.push("  Hinweis: " + w));
+  });
+  L.push("", S.abc);
+  const txt = L.join("\n"), ta = $("#diagOut");
+  ta.value = txt; ta.hidden = false;
+  try { await navigator.clipboard.writeText(txt); toast("Details kopiert. Du kannst sie direkt in den Chat einfügen.", 3500); }
+  catch (e) { ta.focus(); ta.select(); toast("Text ist markiert, bitte kopieren.", 3500); }
+});
 
 /* ---------- Erkennung auf dem Foto zeigen ---------- */
 function drawScan() {
