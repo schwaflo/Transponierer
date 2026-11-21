@@ -1685,6 +1685,8 @@ function classifyAcc(GT, gl, S) {
   if (h < 1.5 || h > 3.9 || w < 0.3 || w > 1.5) return null;
   const st = GT.strokes(gl, R(1.25 * S));
   if (st.length >= 2) {
+    // Kreuz und Auflösungszeichen sind etwa drei Linienabstände hoch (Achtelpausen nur gut zwei)
+    if (h < 2.5) return null;
     const L = st[0], Rr = st[st.length - 1];
     if ((Rr.x0 + Rr.x1) / 2 - (L.x0 + L.x1) / 2 < 0.2 * S) return null;
     if (Rr.y0 - L.y0 > 0.45 * S && Rr.y1 - L.y1 > 0.45 * S) return "natural";
@@ -1758,6 +1760,11 @@ function repairSystems(systems, measure16) {
       const near = st.events.filter(e => e.type === "bar" && Math.abs(e.x - rb.x) < 1.2 * S);
       if (near.length) near.forEach(c => { if (!/:/.test(c.kind)) c.kind = rb.kind; });
       else { st.events.push({ type: "bar", x: rb.x, kind: rb.kind }); st.events.sort((a, b) => a.x - b.x); }
+    }
+    // 2a) Schlussstrich oder dicker Doppelstrich mitten in der Zeile ist meist ein falsch gelesener Taktstrich
+    for (const st of sys) {
+      const bars = st.events.filter(e => e.type === "bar");
+      bars.forEach((b, k) => { if (k < bars.length - 1 && (b.kind === "|]" || b.kind === "[|")) b.kind = "||"; });
     }
     // 2b) vor einer 2. (oder späteren) Klammer steht immer ein Wiederholungsstrich
     for (const st of sys) {
