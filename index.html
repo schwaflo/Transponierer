@@ -703,11 +703,12 @@ function staffExtent(b, w, h, Y, S) {
     let c = 0;
     for (let k = 0; k < 5; k++) {
       const y = R(Y[k][x]); if (y < 1 || y >= h - 1) continue;
-      if (b[y * w + x] || b[(y - 1) * w + x] || b[(y + 1) * w + x]) c++;
+      if (b[y * w + x] || b[(y - 1) * w + x] || b[(y + 1) * w + x] || (y > 1 && b[(y - 2) * w + x]) || (y < h - 2 && b[(y + 2) * w + x])) c++;
     }
     ok[x] = c >= 4 ? 1 : 0;
   }
-  const gap = Math.max(3, R(0.8 * S));
+  // Lücken durch unscharfe oder blasse Linien überbrücken
+  const gap = Math.max(3, R(2.5 * S));
   let best = [0, -1], start = -1, last = -10 * w;
   for (let x = 0; x < w; x++) {
     if (!ok[x]) continue;
@@ -1079,7 +1080,7 @@ function processWithS(g0, W0, H0, Sguess, opts, progress, warnings) {
     maxL = Math.max(st.T + 2, R(st.T * 1.8) + 1);
     thin = thinMask(b, w, h, maxL);
   }
-  g = null;
+  const gray = g;
   const T = st.T, S0 = st.S;
   progress("Notenlinien werden gesucht", 0.25);
   const found = findStaves(thin, w, h, S0, T);
@@ -1127,30 +1128,54 @@ function processWithS(g0, W0, H0, Sguess, opts, progress, warnings) {
   const { lab, comps } = label(nb, w, h);
   const GT = glyphTools(lab, w);
   const ann = { skip: new Set(), marks: staves.map(() => ({ voltas: [], words: [], codas: [] })) };
-  const ctx = { ann, b, nb, nbF, w, h, fill, fillF, fillH, fillC, lab, comps, GT, segs, templates: opts.templates || [], debug: !!opts.debug, holeThr: opts.holeThr || 0.09 };
+  const ctx = { ann, gray, b, nb, nbF, w, h, fill, fillF, fillH, fillC, lab, comps, GT, segs, templates: opts.templates || [], debug: !!opts.debug, holeThr: opts.holeThr || 0.09 };
 
   try { Object.assign(ann, detectAnnotations(ctx, staves, holeList, opts.wordTemplates)); } catch (e) { warnings.push("Zusatzzeichen konnten nicht gelesen werden."); }
-  const out = [];
-  staves.forEach((s, si) => {
-    progress(`Notensystem ${si + 1} von ${staves.length} wird gelesen`, 0.6 + 0.35 * si / staves.length);
-    out.push(readStaff(ctx, s, si, staves));
-  });
-  // Systeme: Notenzeilen, die durch Taktstriche verbunden sind
+  // Systeme: Notenzeilen gehören zusammen, wenn ein Strich oder eine Klammer sie verbindet,
+  // oder wenn (in mehrzeiligen Stücken) ihr Abstand deutlich kleiner ist als der zwischen Systemen
+  const linkSeg = i => { const a = staves[i - 1], c = staves[i];
+    return segs.some(sg => sg.top <= a.bmax + 0.5 * a.S && sg.bot >= c.tmin - 0.5 * c.S && sg.top < a.bmax && sg.bot > c.tmin &&
+      sg.x >= Math.max(a.x0, c.x0) - a.S && sg.x <= Math.min(a.x1, c.x1) + a.S); };
+  const linkBrace = i => { const a = staves[i - 1], c = staves[i], xl = Math.min(a.x0, c.x0);
+    return comps.some(cp => cp && cp.x1 <= xl + 0.6 * a.S && cp.x0 >= xl - 3.5 * a.S && cp.y0 <= a.bmax && cp.y1 >= c.tmin && (cp.y1 - cp.y0) > 6 * a.S); };
+  const gaps = []; for (let i = 1; i < staves.length; i++) gaps.push(staves[i].tmin - staves[i - 1].bmax);
+  let gapThr = -Infinity;
+  if (gaps.length >= 2) {
+    const sg = gaps.slice().sort((a, b2) => a - b2); let best = 1, at = -1;
+    for (let k = 1; k < sg.length; k++) { const r = sg[k] / Math.max(1, sg[k - 1]); if (r > best) { best = r; at = k; } }
+    if (best >= 1.35) gapThr = (sg[at] + sg[at - 1]) / 2;
+  }
+  const strong = []; for (let i = 1; i < staves.length; i++) strong.push(linkSeg(i) || linkBrace(i));
+  const anyLink = strong.some(Boolean);
   const systems = []; let cur = [0];
   for (let i = 1; i < staves.length; i++) {
-    const a = staves[i - 1], c = staves[i];
-    const linked = segs.some(sg => sg.top <= a.bmax + 0.5 * a.S && sg.bot >= c.tmin - 0.5 * c.S && sg.top < a.bmax && sg.bot > c.tmin &&
-      sg.x >= Math.max(a.x0, c.x0) - a.S && sg.x <= Math.min(a.x1, c.x1) + a.S);
-    if (linked) cur.push(i); else { systems.push(cur); cur = [i]; }
+    if (strong[i - 1] || (anyLink && gaps[i - 1] < gapThr)) cur.push(i); else { systems.push(cur); cur = [i]; }
   }
   systems.push(cur);
+  const out = [];
+  staves.forEach((s, si) => {
+    progress(`Notensystem ${si + 1} von ${staves.length} wird gelesen`, 0.6 + 0.3 * si / staves.length);
+    out.push(readStaff(ctx, s, si, staves));
+  });
+  // Abgleich im System: gemeinsamer Bereich für Schlüssel/Tonart/Takt und gleiche Vorzeichenzahl
+  for (const sys of systems) {
+    if (sys.length < 2) continue;
+    const maxStart = Math.max(...sys.map(i => out[i].contentStart));
+    const votes = {}; sys.forEach(i => { const k = out[i].sharps ? "s" + out[i].sharps : out[i].flats ? "f" + out[i].flats : ""; if (k) votes[k] = (votes[k] || 0) + 1; });
+    const kv = Object.keys(votes).sort((a, b2) => votes[b2] - votes[a])[0];
+    const key = kv ? { sharps: kv[0] === "s" ? +kv.slice(1) : 0, flats: kv[0] === "f" ? +kv.slice(1) : 0 } : null;
+    for (const i of sys) {
+      const r = out[i], noKey = !r.sharps && !r.flats;
+      if (r.contentStart < maxStart - 0.6 * staves[i].S || (key && noKey)) out[i] = readStaff(ctx, staves[i], i, staves, { contentStart: maxStart, key });
+    }
+  }
   base.staves = out; base.systems = systems;
   if (opts.debug) { base._nb = nb; base._b = b; base._holes = holeList.map(hl => ({ x: hl.x0, y: hl.y0, w: +hl.w.toFixed(2), h: +hl.h.toFixed(2), a: +hl.a.toFixed(3) })); }
   progress("Fertig", 1);
   return base;
 }
 
-function readStaff(ctx, s, si, all) {
+function readStaff(ctx, s, si, all, ov) {
   const { nb, w, h, fill, lab, comps, GT, segs } = ctx, S = s.S;
   const res = { idx: si, S, x0: s.x0, x1: s.x1, clef: null, sharps: 0, flats: 0, ts: null, events: [], dbg: { heads: [], rests: [], accs: [], bars: [], boxes: [], dots: [] } };
   res.lines = [0, 1, 2, 3, 4].map(k => { const pts = []; for (let x = s.x0; x <= s.x1; x += Math.max(4, R(2 * S))) pts.push([x, s.Y[k][x]]); pts.push([s.x1, s.Y[k][s.x1]]); return pts; });
@@ -1254,7 +1279,11 @@ function readStaff(ctx, s, si, all) {
       }
     }
   }
-  const contentStart = x + 0.3 * S;
+  let contentStart = x + 0.3 * S;
+  if (ov) {
+    if (ov.contentStart > contentStart) contentStart = ov.contentStart;
+    if (ov.key && !res.sharps && !res.flats) { res.sharps = ov.key.sharps; res.flats = ov.key.flats; }
+  }
   res.contentStart = contentStart;
   if (ctx.debug) res.dbg.pre = pre.slice(0, 8).map(g => `${R((g.x0 - s.x0) / S * 10) / 10}+${R((g.x1 - g.x0) / S * 10) / 10}w ${R((g.y1 - g.y0) / S * 10) / 10}h y${R((g.y0 - top) / S * 10) / 10}`);
   // Noten außerhalb der fünf Linien brauchen Hilfslinien (im Originalbild)
@@ -1314,8 +1343,9 @@ function readStaff(ctx, s, si, all) {
             if (p < -9 || p > 17 || !ledgersOk(p, hx)) continue;
             const hole = Math.max(fillH(hx - 0.6 * S, hy - 0.42 * S, hx + 0.6 * S, hy + 0.42 * S) * 1.2 * 0.84,
               1 - ctx.fillC(hx - 0.32 * S, hy - 0.2 * S, hx + 0.32 * S, hy + 0.2 * S));
+            const light = innerLightness(ctx, hx, hy, S);
             const wd = (xb - xa + 1 + 2 * a) / S;
-            heads.push({ x: hx, y: hy, p, filled: hole < ctx.holeThr && !breve, hole, wide: wd > 1.45 || breve, breve });
+            heads.push({ x: hx, y: hy, p, filled: hole < ctx.holeThr && light < 0.15 && !breve, hole, light, wide: wd > 1.45 || breve, breve });
           }
         }
       }
@@ -1358,10 +1388,35 @@ function readStaff(ctx, s, si, all) {
       // Taktstrich-artig (genau Linie 1 bis 5): nur wenn der Kopf ganz am Ende sitzt
       const barLike = Math.abs(sg.top - s.top(sg.x)) < 0.4 * S && Math.abs(sg.bot - s.bot(sg.x)) < 0.4 * S;
       if (barLike && Math.min(Math.abs(hd.y - sg.y1), Math.abs(hd.y - sg.y0)) > 0.7 * S) continue;
-      const sc = adx + 0.1 * Math.min(Math.abs(hd.y - sg.y1), Math.abs(hd.y - sg.y0));
+      // Hals rechts vom Kopf zeigt nach oben (Kopf am unteren Ende), links nach unten (Kopf am oberen Ende)
+      const endDist = dx > 0 ? Math.abs(hd.y - sg.y1) : Math.abs(hd.y - sg.y0);
+      const sc = adx + 0.6 * endDist;
+      (hd.cands = hd.cands || []).push({ sg, up: dx > 0 });
       if (sc < bd) { bd = sc; best = sg; }
     }
     hd.stem = best;
+  }
+  // Übereinanderstehende Köpfe mit einem Hals nach oben und einem nach unten (zwei Stimmen):
+  // der obere Kopf gehört zum Hals nach oben, der untere zum Hals nach unten
+  {
+    const groups = new Map();
+    for (const hd of heads) {
+      const ups = (hd.cands || []).filter(c => c.up), dns = (hd.cands || []).filter(c => !c.up);
+      if (!ups.length || !dns.length) continue;
+      const u = ups.reduce((a, c) => (Math.abs(c.sg.x - hd.x) < Math.abs(a.sg.x - hd.x) ? c : a)).sg;
+      const d = dns.reduce((a, c) => (Math.abs(c.sg.x - hd.x) < Math.abs(a.sg.x - hd.x) ? c : a)).sg;
+      const key = heads.indexOf(hd) >= 0 ? u.x0 + ":" + d.x0 : "";
+      if (!groups.has(key)) groups.set(key, { u, d, hs: [] });
+      groups.get(key).hs.push(hd);
+    }
+    for (const { u, d, hs } of groups.values()) {
+      if (hs.length < 2) continue;
+      hs.sort((a, b2) => a.y - b2.y);
+      // Grenze: größter senkrechter Abstand zwischen benachbarten Köpfen
+      let cut = 1, gap = -1;
+      for (let k = 1; k < hs.length; k++) { const g2 = hs[k].y - hs[k - 1].y; if (g2 > gap) { gap = g2; cut = k; } }
+      hs.forEach((hd, k) => { hd.stem = k < cut ? u : d; });
+    }
   }
   // Ein Hals trägt Köpfe nur an einem Ende: Köpfe an der Gegenseite (meist Balken) verwerfen
   {
@@ -1555,7 +1610,7 @@ function readStaff(ctx, s, si, all) {
     }
   }
 
-  for (const n of merged) for (const hd of n.heads) res.dbg.heads.push({ x: hd.x, y: hd.y, filled: hd.filled, acc: hd.acc || null, hole: +(hd.hole || 0).toFixed(3) });
+  for (const n of merged) for (const hd of n.heads) res.dbg.heads.push({ x: hd.x, y: hd.y, filled: hd.filled, acc: hd.acc || null, hole: +(hd.hole || 0).toFixed(3), light: +(hd.light || 0).toFixed(2) });
   for (const r of rests) res.dbg.rests.push({ ...r.box, kind: r.kind });
 
   const ev = [];
@@ -1592,6 +1647,22 @@ function readStaff(ctx, s, si, all) {
   return res;
 }
 
+// Helligkeit im Kopfinneren relativ zu Tinte und Papier (0 = Tinte, 1 = Papier); ein Schlitz ist heller als Tinte
+function innerLightness(ctx, x, y, S) {
+  const { gray, b, w, h } = ctx;
+  if (!gray) return 0;
+  let sInk = 0, nInk = 0, sPap = 0, nPap = 0;
+  const xa = Math.max(0, R(x - 1.3 * S)), xb = Math.min(w - 1, R(x + 1.3 * S)), ya = Math.max(0, R(y - 1.1 * S)), yb = Math.min(h - 1, R(y + 1.1 * S));
+  for (let yy = ya; yy <= yb; yy += 2) for (let xx = xa; xx <= xb; xx += 2) { const i = yy * w + xx; if (b[i]) { sInk += gray[i]; nInk++; } else { sPap += gray[i]; nPap++; } }
+  if (!nInk || !nPap) return 0;
+  const ink = sInk / nInk, paper = sPap / nPap;
+  if (paper - ink < 30) return 0;
+  const vals = [];
+  for (let yy = R(y - 0.16 * S); yy <= R(y + 0.16 * S); yy++) for (let xx = R(x - 0.3 * S); xx <= R(x + 0.3 * S); xx++) if (yy >= 0 && yy < h && xx >= 0 && xx < w) vals.push(gray[yy * w + xx]);
+  if (!vals.length) return 0;
+  vals.sort((a, b2) => a - b2);
+  return clamp((vals[Math.floor(vals.length * 0.85)] - ink) / (paper - ink), 0, 1);
+}
 function classifyAcc(GT, gl, S) {
   const w = (gl.x1 - gl.x0 + 1) / S, h = (gl.y1 - gl.y0 + 1) / S;
   if (h < 1.5 || h > 3.9 || w < 0.3 || w > 1.5) return null;
