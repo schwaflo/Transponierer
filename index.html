@@ -1196,15 +1196,18 @@ function readStaff(ctx, s, si, all, ov) {
     else if (gl.x0 <= U.x1 + 0.15 * S) U = { x0: Math.min(U.x0, gl.x0), y0: Math.min(U.y0, gl.y0), x1: Math.max(U.x1, gl.x1), y1: Math.max(U.y1, gl.y1) };
   }
   if (U) {
-    const H = (U.y1 - U.y0 + 1) / S;
+    const H = (U.y1 - U.y0 + 1) / S, above = (top - U.y0) / S, below = (U.y1 - bot) / S;
+    res.clefConf = 1;
     if (H >= 2) {
-      if (H >= 5) res.clef = "treble";
-      else if (U.y1 - top < 3.75 * S && U.y0 < top + 0.7 * S) res.clef = "bass";
+      // Violinschlüssel ragt oben und unten aus dem System, Bassschlüssel beginnt oben und endet über der untersten Linie
+      if (H >= 5 && below >= 0.5 && above >= 0.3) res.clef = "treble";
+      else if (U.y1 - top < 3.75 * S && U.y0 < top + 0.7 * S && above < 1.2) res.clef = "bass";
+      else if (H >= 5) { res.clef = "treble"; res.clefConf = 0.5; }
       else if (H >= 3.0) {
         // C-Schlüssel: die Mitte zeigt auf die Linie des c'
         const pc = s.posOf((U.y0 + U.y1) / 2, (U.x0 + U.x1) / 2), line = clamp(R(pc / 2), 0, 4);
         res.clef = ["bass3", "tenor", "alto", "alto2", "alto1"][line];
-      } else res.clef = "treble";
+      } else { res.clef = "treble"; res.clefConf = 0.3; }
       res.dbg.boxes.push({ ...U, kind: "clef", label: CLEF_NAMES[res.clef] || "Schlüssel" });
       x = U.x1;
     }
@@ -1826,18 +1829,28 @@ function buildAbc(pages, opts) {
     clefs.push(f ? f[v].clef : (nv === 2 && v === 1 ? "bass" : "treble"));
   }
   // Systeme mit weniger Zeilen: jede Zeile der Stimme mit passendem Schlüssel zuordnen (z. B. Bass bleibt Stimme 3)
+  // Weniger Zeilen als Stimmen: oberste Zeile = Stimme 1, unterste = tiefste Stimme, mittlere nach Schlüssel
   const voiceOf = sys => {
     if (sys.length === nv) return sys.map((_, j) => j);
-    const out = []; let next = 0;
-    sys.forEach((st, j) => {
+    if (sys.length === 1) return [clefs.indexOf(sys[0].clef) >= 0 ? clefs.indexOf(sys[0].clef) : 0];
+    const out = [0]; let next = 1;
+    for (let j = 1; j < sys.length - 1; j++) {
       const left = sys.length - j - 1;
       let v = -1;
-      for (let k = next; k <= nv - 1 - left; k++) if (clefs[k] === st.clef) { v = k; break; }
+      for (let k = next; k <= nv - 1 - left; k++) if (clefs[k] === sys[j].clef) { v = k; break; }
       if (v < 0) v = Math.min(next, nv - 1 - left);
       out.push(v); next = v + 1;
-    });
+    }
+    out.push(nv - 1);
     return out;
   };
+  // Schlüssel je Stimme per Mehrheit; einzelne Fehlerkennungen werden überstimmt
+  {
+    const tally = clefs.map(() => ({}));
+    systems.forEach(sys => voiceOf(sys).forEach((v, j) => { const c = sys[j].clef; if (c) tally[v][c] = (tally[v][c] || 0) + (sys[j].clefConf || 1); }));
+    tally.forEach((t, v) => { const best = Object.keys(t).sort((a, b) => t[b] - t[a])[0]; if (best) clefs[v] = best; });
+    systems.forEach(sys => voiceOf(sys).forEach((v, j) => { sys[j].clef = clefs[v]; }));
+  }
   void full;
   const votes = {};
   systems.forEach(s => s.forEach(st => { report.staves++; const k = st.sharps >= st.flats ? st.sharps : -st.flats; votes[k] = (votes[k] || 0) + 1; }));
@@ -2113,7 +2126,8 @@ function titleOf(visual, fallback) {
   return (t && String(t).trim()) || fallback || "Unbenannt";
 }
 function meterOf(v) { try { const m = v.getMeterFraction(); return m && m.num ? m.num + "/" + m.den : ""; } catch (e) { return ""; } }
-function bpmOf(v) { try { return Math.round(v.getBpm()); } catch (e) { return 0; } }
+// Tempo immer in Viertelschlägen anzeigen (bei 2/2 zählt abcjs halbe Noten)
+function bpmOf(v) { try { return Math.round(v.getBpm() * (v.getBeatLength() || 0.25) / 0.25); } catch (e) { return 0; } }
 function slug(s) { return (s || "Noten").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/ß/g, "ss").replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "Noten"; }
 function computeSteps(origPc) {
   if (S.tr.mode === "instr") { const p = presetById(S.tr.preset); return p ? p.steps : 0; }
