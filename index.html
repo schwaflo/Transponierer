@@ -339,7 +339,7 @@ textarea{width:100%;min-height:150px;resize:vertical;border:1px solid var(--line
               <span><i style="background:#F08C00"></i>Pausen</span>
               <span><i style="background:#E03131"></i>Vorzeichen</span>
               <span><i style="background:#7B3FE4"></i>Taktstriche</span>
-              <span><i style="background:#0B8F8F"></i>Schlüssel, Tonart, Takt</span>
+              <span><i style="background:#0B8F8F"></i>Schlüssel, Tonart, Takt, Klammern 1./2., Fine/D.C.</span>
             </p>
             <div id="scanPages" class="scan-pages"></div>
           </div>
@@ -553,6 +553,22 @@ function integral(b, w, h) {
   }
   return I;
 }
+// Schließen (erst verdicken, dann verdünnen): füllt haarfeine Schlitze in Notenköpfen
+function closeBin(b, w, h, r) {
+  if (r < 1) return b.slice();
+  const W1 = w + 1;
+  const box = (I, x, y) => {
+    const x0 = Math.max(0, x - r), x1 = Math.min(w - 1, x + r), y0 = Math.max(0, y - r), y1 = Math.min(h - 1, y + r);
+    return [I[(y1 + 1) * W1 + x1 + 1] - I[y0 * W1 + x1 + 1] - I[(y1 + 1) * W1 + x0] + I[y0 * W1 + x0], (x1 - x0 + 1) * (y1 - y0 + 1)];
+  };
+  let I = integral(b, w, h);
+  const d = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) d[y * w + x] = box(I, x, y)[0] > 0 ? 1 : 0;
+  I = integral(d, w, h);
+  const e = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const [sum, n] = box(I, x, y); e[y * w + x] = sum === n ? 1 : 0; }
+  return e;
+}
 function makeFill(I, w, h) {
   const W1 = w + 1;
   return (x0, y0, x1, y1) => {
@@ -716,7 +732,7 @@ function mkStaff(S, T, Y, x0, x1, w) {
 function findHoles(closed, w, h, S) {
   const lab = new Int32Array(w * h), st = [], out = [];
   let id = 0;
-  const maxW = 1.1 * S, maxH = 0.95 * S, minA = 0.06 * S * S;
+  const maxW = 1.1 * S, maxH = 0.95 * S, minA = Math.max(3, 0.02 * S * S);
   for (let i = 0; i < w * h; i++) {
     if (closed[i] || lab[i]) continue;
     id++; lab[i] = id; st.push(i);
@@ -907,6 +923,25 @@ function zoneFeatures(get, x0, y0, x1, y1) {
   f[GX * GY] = W / H;
   return f;
 }
+// Dichteraster für Wortvergleich (Fine, D.C. al Fine …)
+function gridFeatures(get, x0, y0, x1, y1, GX, GY) {
+  GX = GX || 32; GY = GY || 8;
+  const f = new Float32Array(GX * GY), W = x1 - x0 + 1, H = y1 - y0 + 1;
+  for (let gy = 0; gy < GY; gy++) for (let gx = 0; gx < GX; gx++) {
+    const xa = x0 + Math.floor(gx * W / GX), xb = Math.max(xa, x0 + Math.floor((gx + 1) * W / GX) - 1);
+    const ya = y0 + Math.floor(gy * H / GY), yb = Math.max(ya, y0 + Math.floor((gy + 1) * H / GY) - 1);
+    let c = 0, t = 0;
+    for (let y = ya; y <= yb; y++) for (let x = xa; x <= xb; x++) { t++; if (get(x, y)) c++; }
+    f[gy * GX + gx] = t ? c / t : 0;
+  }
+  return f;
+}
+function corr(a, b) {
+  let ma = 0, mb = 0; for (let i = 0; i < a.length; i++) { ma += a[i]; mb += b[i]; } ma /= a.length; mb /= b.length;
+  let sab = 0, saa = 0, sbb = 0;
+  for (let i = 0; i < a.length; i++) { const da = a[i] - ma, db = b[i] - mb; sab += da * db; saa += da * da; sbb += db * db; }
+  return saa && sbb ? sab / Math.sqrt(saa * sbb) : 0;
+}
 function featDist(a, b) {
   let s = 0; for (let i = 0; i < a.length - 1; i++) { const d = a[i] - b[i]; s += d * d; }
   return Math.sqrt(s) + 1.2 * Math.abs(a[a.length - 1] - b[b.length - 1]);
@@ -920,6 +955,89 @@ function classifyChar(feat, templates, allowed) {
   let best = null, bd = 1e9;
   for (const t of templates) { if (allowed && !allowed.includes(t.ch)) continue; const d = featDist(feat, t.f); if (d < bd) { bd = d; best = t.ch; } }
   return { ch: best, d: bd };
+}
+
+/* ================= Klammern 1./2., Coda-Zeichen, Fine / D.C. / D.S. ================= */
+function detectAnnotations(ctx, staves, holeList, wordTemplates) {
+  const { comps, lab, w } = ctx, skip = new Set();
+  const marks = staves.map(() => ({ voltas: [], words: [], codas: [] }));
+  staves.forEach((s, si) => {
+    const S = s.S, prev = staves[si - 1], lim = prev ? prev.bmax + 0.8 * S : -1e9;
+    const cand = comps.filter(c => {
+      if (!c || c.x1 < s.x0 - S || c.x0 > s.x1 + S || c.y0 <= lim) return false;
+      const t = s.top((c.x0 + c.x1) / 2);
+      return c.y1 < t - 0.3 * S && c.y0 > t - 6.5 * S;
+    });
+    // Klammern: waagerechte Linie oben, Haken links nach unten, Ziffer darunter
+    for (const c of cand) {
+      const cw = c.x1 - c.x0 + 1, chh = c.y1 - c.y0 + 1;
+      if (cw < 2.5 * S || chh < 0.6 * S || chh > 3.4 * S) continue;
+      let lineRow = -1;
+      for (let y = c.y0; y <= Math.min(c.y1, c.y0 + Math.max(2, R(0.35 * S))); y++) {
+        let n = 0; for (let x = c.x0; x <= c.x1; x++) if (lab[y * w + x] === c.id) n++;
+        if (n >= 0.8 * cw) { lineRow = y; break; }
+      }
+      if (lineRow < 0) continue;
+      let hook = 0;
+      for (let x = c.x0; x <= c.x0 + R(0.4 * S); x++) {
+        let run = 0; for (let y = lineRow; y <= c.y1; y++) { if (lab[y * w + x] === c.id) run++; else if (run > 1) break; }
+        hook = Math.max(hook, run);
+      }
+      if (hook < 0.7 * S) continue;
+      const num = comps.find(d => d && d !== c && d.x0 >= c.x0 + 0.1 * S && d.x1 <= c.x0 + 2.4 * S && d.y0 >= lineRow - 0.2 * S && d.y1 <= lineRow + 2.6 * S && (d.y1 - d.y0) >= 0.45 * S && (d.y1 - d.y0) <= 2.2 * S);
+      let n = 0;
+      if (num) {
+        if (ctx.templates.length) {
+          const get = (x2, y2) => lab[y2 * w + x2] === num.id;
+          const r = classifyChar(zoneFeatures(get, num.x0, num.y0, num.x1, num.y1), ctx.templates, ["1", "2", "3"]);
+          if (r.d < 2.8) n = +r.ch;
+        }
+        skip.add(num.id);
+      }
+      skip.add(c.id);
+      marks[si].voltas.push({ x: c.x0, x1: c.x1, n, box: { x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1 } });
+    }
+    // Coda-Zeichen: Kreis mit Kreuz, also mehrere kleine Löcher
+    for (const c of cand) {
+      if (skip.has(c.id)) continue;
+      const cw = (c.x1 - c.x0 + 1) / S, chh = (c.y1 - c.y0 + 1) / S;
+      if (cw < 1.0 || cw > 2.8 || chh < 1.0 || chh > 2.8 || Math.abs(cw - chh) > 0.7) continue;
+      const nh = holeList.filter(hl => hl.x0 >= c.x0 && hl.x1 <= c.x1 && hl.y0 >= c.y0 && hl.y1 <= c.y1).length;
+      if (nh >= 3) { marks[si].codas.push({ x: (c.x0 + c.x1) / 2, box: { x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1 } }); skip.add(c.id); }
+    }
+    // Wörter: Buchstaben auf einer Grundlinie zu Ausdrücken gruppieren und mit Vorlagen vergleichen
+    if (wordTemplates && wordTemplates.length) {
+      const tc = cand.filter(c => !skip.has(c.id) && (c.y1 - c.y0 + 1) <= 2.8 * S && (c.x1 - c.x0 + 1) <= 3 * S).sort((a, b) => a.x0 - b.x0);
+      const phrases = [];
+      for (const c of tc) {
+        const ch = c.y1 - c.y0 + 1;
+        let ph = phrases.find(p => {
+          const H = p.y1 - p.y0 + 1, ov = Math.min(p.y1, c.y1) - Math.max(p.y0, c.y0);
+          return c.x0 - p.x1 < 1.1 * Math.max(H, ch) && c.x0 - p.x1 > -0.3 * S && ov > 0.3 * Math.min(H, ch);
+        });
+        if (ph) { ph.ids.add(c.id); ph.x0 = Math.min(ph.x0, c.x0); ph.y0 = Math.min(ph.y0, c.y0); ph.x1 = Math.max(ph.x1, c.x1); ph.y1 = Math.max(ph.y1, c.y1); ph.n++; }
+        else phrases.push({ ids: new Set([c.id]), x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1, n: 1 });
+      }
+      for (const ph of phrases) {
+        const W = ph.x1 - ph.x0 + 1, H = ph.y1 - ph.y0 + 1;
+        if (ph.n < 2 || H < 0.5 * S) continue;
+        const a = W / H, get = (x2, y2) => ph.ids.has(lab[y2 * w + x2]);
+        const f = gridFeatures(get, ph.x0, ph.y0, ph.x1, ph.y1);
+        let best = null, bs = -1;
+        for (const t of wordTemplates) {
+          if (Math.abs(Math.log(a / t.a)) > 0.3) continue;
+          const c = corr(f, t.f);
+          if (c > bs) { bs = c; best = t; }
+        }
+        if (ctx.debug) (marks[si].dbgWords = marks[si].dbgWords || []).push({ x: ph.x0, a: +a.toFixed(2), n: ph.n, best: best && best.kind, c: +bs.toFixed(2) });
+        if (best && bs >= 0.5) {
+          marks[si].words.push({ kind: best.kind, x0: ph.x0, x1: ph.x1, box: { x0: ph.x0, y0: ph.y0, x1: ph.x1, y1: ph.y1 } });
+          ph.ids.forEach(id => skip.add(id));
+        }
+      }
+    }
+  });
+  return { skip, marks };
 }
 
 /* ================= Hauptfunktion pro Seite ================= */
@@ -1001,14 +1119,17 @@ function processWithS(g0, W0, H0, Sguess, opts, progress, warnings) {
   });
   const holes = new Uint8Array(w * h);
   for (const hl of holeList) for (const p of hl.pix) holes[p] = 1;
-  const nbF = closed;
-  for (let i = 0; i < w * h; i++) if (holes[i]) nbF[i] = 1;
+  const fillC = makeFill(integral(closed, w, h), w, h); // Tinte inkl. Notenlinien, ohne gefüllte Löcher
+  for (let i = 0; i < w * h; i++) if (holes[i]) closed[i] = 1;
+  const nbF = closeBin(closed, w, h, Math.max(1, R(0.1 * Smed)));
   const fillF = makeFill(integral(nbF, w, h), w, h), fillH = makeFill(integral(holes, w, h), w, h);
   progress("Symbole werden zerlegt", 0.55);
   const { lab, comps } = label(nb, w, h);
   const GT = glyphTools(lab, w);
-  const ctx = { b, nb, nbF, w, h, fill, fillF, fillH, lab, comps, GT, segs, templates: opts.templates || [], debug: !!opts.debug, holeThr: opts.holeThr || 0.15 };
+  const ann = { skip: new Set(), marks: staves.map(() => ({ voltas: [], words: [], codas: [] })) };
+  const ctx = { ann, b, nb, nbF, w, h, fill, fillF, fillH, fillC, lab, comps, GT, segs, templates: opts.templates || [], debug: !!opts.debug, holeThr: opts.holeThr || 0.09 };
 
+  try { Object.assign(ann, detectAnnotations(ctx, staves, holeList, opts.wordTemplates)); } catch (e) { warnings.push("Zusatzzeichen konnten nicht gelesen werden."); }
   const out = [];
   staves.forEach((s, si) => {
     progress(`Notensystem ${si + 1} von ${staves.length} wird gelesen`, 0.6 + 0.35 * si / staves.length);
@@ -1035,7 +1156,7 @@ function readStaff(ctx, s, si, all) {
   res.lines = [0, 1, 2, 3, 4].map(k => { const pts = []; for (let x = s.x0; x <= s.x1; x += Math.max(4, R(2 * S))) pts.push([x, s.Y[k][x]]); pts.push([s.x1, s.Y[k][s.x1]]); return pts; });
   const bandTop = s.tmin - 4.5 * S, bandBot = s.bmax + 4.5 * S;
   const inBand = c => c.cy > s.tmin - 3 * S && c.cy < s.bmax + 3 * S;
-  const near = comps.filter(c => c && c.x1 >= s.x0 - S && c.x0 <= s.x1 + S && c.y1 > bandTop && c.y0 < bandBot && c.n >= 0.015 * S * S);
+  const near = comps.filter(c => c && !ctx.ann.skip.has(c.id) && c.x1 >= s.x0 - S && c.x0 <= s.x1 + S && c.y1 > bandTop && c.y0 < bandBot && c.n >= 0.015 * S * S);
 
   /* ---- Anfang der Zeile: Schlüssel, Vorzeichen, Taktart ---- */
   const pre = groupGlyphs(near.filter(c => c.x0 <= s.x0 + 18 * S && c.x0 >= s.x0 - 0.3 * S && inBand(c)), S);
@@ -1045,6 +1166,7 @@ function readStaff(ctx, s, si, all) {
     if (gl.x0 > s.x0 + 3.4 * S) break;
     const gw = gl.x1 - gl.x0 + 1, gh = gl.y1 - gl.y0 + 1;
     if (gw < 0.5 * S && gh > 3.4 * S) continue;
+    if (gh > 9 * S) continue; // Akkolade oder Klammer über mehrere Zeilen
     if (!U) { if ((gl.x0 + gl.x1) / 2 <= s.x0 + 3.4 * S && gh >= 1.2 * S) U = { x0: gl.x0, y0: gl.y0, x1: gl.x1, y1: gl.y1 }; }
     else if (gl.x0 <= U.x1 + 0.15 * S) U = { x0: Math.min(U.x0, gl.x0), y0: Math.min(U.y0, gl.y0), x1: Math.max(U.x1, gl.x1), y1: Math.max(U.y1, gl.y1) };
   }
@@ -1052,7 +1174,7 @@ function readStaff(ctx, s, si, all) {
     const H = (U.y1 - U.y0 + 1) / S;
     if (H >= 2) {
       if (H >= 5) res.clef = "treble";
-      else if (U.y1 < bot - 0.6 * S) res.clef = "bass";
+      else if (U.y1 - top < 3.75 * S && U.y0 < top + 0.7 * S) res.clef = "bass";
       else if (H >= 3.0) {
         // C-Schlüssel: die Mitte zeigt auf die Linie des c'
         const pc = s.posOf((U.y0 + U.y1) / 2, (U.x0 + U.x1) / 2), line = clamp(R(pc / 2), 0, 4);
@@ -1070,6 +1192,10 @@ function readStaff(ctx, s, si, all) {
     if (gl.x0 > x + 1.8 * S) break;
     if ((gl.y1 - gl.y0) < 1.4 * S && (gl.x1 - gl.x0) < 0.7 * S) { if (res.clef === "bass") x = gl.x1; continue; } // Punkte des Bassschlüssels
     let t = classifyAcc(GT, gl, S), box = gl;
+    const nx = pre[i + 1];
+    if (!t && narrow(gl) && nx && !narrow(nx) && nx.x0 - gl.x1 < 0.4 * S && (nx.y1 - nx.y0) < 1.5 * S && Math.abs(nx.y1 - gl.y1) < 0.5 * S && (nx.x1 - gl.x0) < 1.1 * S) {
+      t = "flat"; box = { x0: gl.x0, y0: gl.y0, x1: nx.x1, y1: Math.max(gl.y1, nx.y1) }; i++;
+    }
     if (!t && narrow(gl) && pre[i + 1] && narrow(pre[i + 1]) && pre[i + 1].x0 - gl.x1 < 0.55 * S && Math.abs(pre[i + 1].y0 - gl.y0) < 0.9 * S) {
       t = "sharp"; box = { x0: gl.x0, y0: Math.min(gl.y0, pre[i + 1].y0), x1: pre[i + 1].x1, y1: Math.max(gl.y1, pre[i + 1].y1) }; i++;
     }
@@ -1095,9 +1221,10 @@ function readStaff(ctx, s, si, all) {
     let blob = false;
     for (let yy = T2.y0; yy <= T2.y1 && !blob; yy += Math.max(1, R(S / 4)))
       for (let xx = T2.x0; xx <= T2.x1; xx += Math.max(1, R(S / 4)))
-        if (ctx.fill(xx - 0.3 * S, yy - 0.3 * S, xx + 0.3 * S, yy + 0.3 * S) > 0.93) { blob = true; break; }
+        if (ctx.fill(xx - 0.38 * S, yy - 0.34 * S, xx + 0.38 * S, yy + 0.34 * S) > 0.92) { blob = true; break; }
     const getter = (x2, y2) => col.some(gl => gl.ids.has(lab[y2 * w + x2]));
     const Hs = (T2.y1 - T2.y0 + 1) / S, Ws = (T2.x1 - T2.x0 + 1) / S, centered = Math.abs((T2.y0 + T2.y1) / 2 - mid) < 0.8 * S;
+    if (ctx.debug) res.dbg.ts = { Hs: +Hs.toFixed(2), Ws: +Ws.toFixed(2), centered, blob, n: col.length, x: R((T2.x0 - s.x0) / S * 10) / 10 };
     if (!blob && Hs >= 3.2 && Hs <= 4.9 && !(centered && GT.strokes({ ...T2, ids: new Set(col.flatMap(g => [...g.ids])) }, R(2.4 * S)).length)) {
       const up = tightBox(getter, T2.x0, T2.y0, T2.x1, R(mid) - 1), dn = tightBox(getter, T2.x0, R(mid) + 1, T2.x1, T2.y1);
       if (up && dn && (up.y1 - up.y0 + 1) >= 1.2 * S && (dn.y1 - dn.y0 + 1) >= 1.2 * S) {
@@ -1105,7 +1232,7 @@ function readStaff(ctx, s, si, all) {
         const c = classifyChar(zoneFeatures(getter, dn.x0, dn.y0, dn.x1, dn.y1), ctx.templates, ["2", "4", "8"]);
         if (a.d < 2.4 && c.d < 2.4) { res.ts = { num: +a.ch, den: +c.ch, d: a.d + c.d }; x = T2.x1; res.dbg.boxes.push({ ...T2, kind: "time", label: a.ch + "/" + c.ch }); }
       }
-    } else if (!blob && centered && Ws >= 0.7 && Ws <= 2.2 && Hs >= 1.4 && Hs <= 4.9) {
+    } else if (centered && Ws >= 0.7 && Ws <= 2.2 && Hs >= 1.4 && Hs <= 4.9) {
       // C (4/4) oder durchgestrichenes C (Alla breve, 2/2): rechts in der Mitte offen, links geschlossen
       const ids = new Set(col.flatMap(g => [...g.ids])), G = { ...T2, ids };
       const cut = Hs >= 2.6 && GT.strokes(G, R(2.2 * S)).length >= 1;
@@ -1113,10 +1240,13 @@ function readStaff(ctx, s, si, all) {
       const tb = tightBox(getter, T2.x0, Math.max(T2.y0, yA), T2.x1, Math.min(T2.y1, yB));
       if (tb) {
         const wC = tb.x1 - tb.x0 + 1;
-        const openRight = GT.fillIn(G, tb.x0 + 0.6 * wC, mid - 0.2 * S, tb.x1, mid + 0.2 * S) < (cut ? 0.35 : 0.2);
+        // Öffnung rechts: irgendwo im mittleren Bereich ein fast leeres Band (Kugel am oberen Ende kann bis zur Mitte reichen)
+        let openMin = 1;
+        for (let yy = R(mid - 0.4 * S); yy <= R(mid + 0.7 * S); yy++) openMin = Math.min(openMin, GT.fillIn(G, tb.x0 + 0.62 * wC, yy - 0.08 * S, tb.x1, yy + 0.08 * S));
+        const openRight = openMin < 0.15;
         const leftInk = GT.fillIn(G, tb.x0, mid - 0.3 * S, tb.x0 + 0.3 * wC, mid + 0.3 * S) > 0.3;
         const a = classifyChar(zoneFeatures(getter, tb.x0, tb.y0, tb.x1, tb.y1), ctx.templates, ["C"]);
-        if (ctx.debug) res.dbg.cdist = a.d;
+        if (ctx.debug) { res.dbg.cdist = a.d; res.dbg.cshape = { cut, openRight: +GT.fillIn(G, tb.x0 + 0.6 * wC, mid - 0.2 * S, tb.x1, mid + 0.2 * S).toFixed(2), leftInk: +GT.fillIn(G, tb.x0, mid - 0.3 * S, tb.x0 + 0.3 * wC, mid + 0.3 * S).toFixed(2), tb: [tb.x0 - T2.x0, tb.x1 - T2.x0, R(tb.y0 - mid), R(tb.y1 - mid)], comps: col.map(g => [g.x0 - T2.x0, g.x1 - T2.x0, R(g.y0 - mid), R(g.y1 - mid)]) }; }
         if ((openRight && leftInk) || a.d < 2.0) {
           res.ts = cut ? { num: 2, den: 2, cut: true } : { num: 4, den: 4, common: true };
           x = T2.x1; res.dbg.boxes.push({ ...T2, kind: "time", label: cut ? "¢" : "C" });
@@ -1182,7 +1312,8 @@ function readStaff(ctx, s, si, all) {
             const hx = sx / n + xA, hy = sy / n + yA;
             const p = R(s.posOf(hy, hx));
             if (p < -9 || p > 17 || !ledgersOk(p, hx)) continue;
-            const hole = fillH(hx - 0.6 * S, hy - 0.42 * S, hx + 0.6 * S, hy + 0.42 * S) * 1.2 * 0.84;
+            const hole = Math.max(fillH(hx - 0.6 * S, hy - 0.42 * S, hx + 0.6 * S, hy + 0.42 * S) * 1.2 * 0.84,
+              1 - ctx.fillC(hx - 0.32 * S, hy - 0.2 * S, hx + 0.32 * S, hy + 0.2 * S));
             const wd = (xb - xa + 1 + 2 * a) / S;
             heads.push({ x: hx, y: hy, p, filled: hole < ctx.holeThr && !breve, hole, wide: wd > 1.45 || breve, breve });
           }
@@ -1191,6 +1322,29 @@ function readStaff(ctx, s, si, all) {
     }
   }
 
+  /* ---- Wiederholungspunkte (zwei Punkte übereinander in den mittleren Zwischenräumen) sind keine Notenköpfe ---- */
+  {
+    const dotLike = near.filter(c => {
+      const cw = (c.x1 - c.x0 + 1) / S, chh = (c.y1 - c.y0 + 1) / S, f = c.n / ((c.x1 - c.x0 + 1) * (c.y1 - c.y0 + 1));
+      return cw >= 0.2 && cw <= 0.7 && chh >= 0.2 && chh <= 0.7 && f >= 0.5;
+    }).map(c => ({ x: (c.x0 + c.x1) / 2, y: (c.y0 + c.y1) / 2 }));
+    const pairs = [];
+    for (const a of dotLike) for (const b2 of dotLike) {
+      if (a === b2 || Math.abs(a.x - b2.x) > 0.35 * S) continue;
+      const pa = s.posOf(a.y, a.x), pb = s.posOf(b2.y, b2.x);
+      if (Math.abs(pa - 3) < 0.7 && Math.abs(pb - 5) < 0.7) pairs.push({ x: (a.x + b2.x) / 2 });
+    }
+    res.repeatDots = pairs;
+    // Striche über die ganze Notenzeile (Taktstriche, Doppelstriche)
+    const barLikeSegs = segs.filter(sg => Math.abs(sg.top - s.top(sg.x)) < 0.6 * S && Math.abs(sg.bot - s.bot(sg.x)) < 0.6 * S);
+    for (let i = heads.length - 1; i >= 0; i--) {
+      const hd = heads[i];
+      if (pairs.some(pr => Math.abs(pr.x - hd.x) < 1.1 * S) && hd.p >= 2 && hd.p <= 6) { heads.splice(i, 1); continue; }
+      // Kopf direkt auf einem Taktstrich oder zwischen zwei eng stehenden Strichen
+      const close = barLikeSegs.filter(sg => Math.abs(sg.x - hd.x) < 0.75 * S);
+      if (close.some(sg => Math.abs(sg.x - hd.x) < 0.45 * S) || close.length >= 2) heads.splice(i, 1);
+    }
+  }
   /* ---- Hälse zuordnen ---- */
   const stemSegs = segs.filter(sg => sg.wd <= Math.max(3, 0.45 * S) && sg.bot > s.tmin - 5 * S && sg.top < s.bmax + 5 * S && sg.x >= contentStart - S && sg.x <= s.x1 + S);
   for (const hd of heads) {
@@ -1231,7 +1385,11 @@ function readStaff(ctx, s, si, all) {
     if (hd.drop) return false;
     if (hd.filled) return !!hd.stem;
     if (hd.stem) return !stemHasFilled.has(hd.stem);
-    return hd.wide;
+    if (!hd.wide) return false;
+    // Ganze Note: links und rechts ein kräftiger Rand aus Tinte, innen Papier
+    const L = ctx.fillC(hd.x - 0.9 * S, hd.y - 0.15 * S, hd.x - 0.45 * S, hd.y + 0.15 * S);
+    const Rr = ctx.fillC(hd.x + 0.45 * S, hd.y - 0.15 * S, hd.x + 0.9 * S, hd.y + 0.15 * S);
+    return L >= 0.4 && Rr >= 0.4;
   });
   const used = new Set(goodHeads.filter(hd => hd.stem).map(hd => hd.stem));
 
@@ -1385,7 +1543,8 @@ function readStaff(ctx, s, si, all) {
       }
       merged.push(n);
     }
-    for (const r of rests) r.v = r.box && (r.box.y0 + r.box.y1) / 2 < midY(r.x) ? 1 : 2;
+    // Pause in der Mitte gilt für beide Stimmen, sonst oben = Stimme 1, unten = Stimme 2
+    for (const r of rests) { const cyR = (r.box.y0 + r.box.y1) / 2, m = midY(r.x); r.v = Math.abs(cyR - m) < 0.9 * S ? 0 : cyR < m ? 1 : 2; }
   } else {
     for (const n of notes) {
       const prev = merged[merged.length - 1];
@@ -1405,8 +1564,29 @@ function readStaff(ctx, s, si, all) {
     for (const hd of n.heads.sort((a, b2) => b2.p - a.p)) { if (seen.has(hd.p)) continue; seen.add(hd.p); hs.push({ p: hd.p, acc: hd.acc || null }); }
     ev.push({ type: "note", x: n.x, heads: hs, dur: n.dur * (n.dot ? 1.5 : 1), beamL: n.beamL, beamR: n.beamR, fermata: !!n.fermata, v: n.v || 1 });
   }
-  for (const r of rests) ev.push({ type: "rest", x: r.x, dur: r.dur, kind: r.kind, v: r.v || 1 });
+  for (const r of rests) ev.push({ type: "rest", x: r.x, dur: r.dur, kind: r.kind, v: r.v == null ? 1 : r.v });
   for (const br of bars) ev.push({ type: "bar", x: br.x, kind: br.kind });
+  ev.sort((a, b2) => a.x - b2.x);
+  // Klammern 1./2. und Ablaufzeichen
+  const mk = ctx.ann.marks[si] || { voltas: [], words: [], codas: [] };
+  const vs = mk.voltas.slice().sort((a, b2) => a.x - b2.x);
+  vs.forEach((v, k) => {
+    let n = v.n;
+    if (!n) { const before = bars.filter(b2 => b2.x < v.x + 0.5 * S).pop(); n = before && /^:/.test(before.kind) ? 2 : (k > 0 && vs[k - 1].n === 1 ? 2 : 1); }
+    v.n = n;
+    ev.push({ type: "volta", x: v.x + 0.01, n });
+    res.dbg.boxes.push({ ...v.box, kind: "volta", label: n + "." });
+  });
+  const notesEv = ev.filter(e => e.type === "note");
+  const deco = (e, d) => { if (e) (e.deco = e.deco || []).push(d); };
+  for (const wd of mk.words) {
+    res.dbg.boxes.push({ ...wd.box, kind: "word", label: wd.kind });
+    const cx = (wd.x0 + wd.x1) / 2;
+    if (wd.kind === "fine") deco(notesEv.reduce((b2, e) => (!b2 || Math.abs(e.x - cx) < Math.abs(b2.x - cx) ? e : b2), null), "fine");
+    else if (wd.kind === "coda") deco(notesEv.find(e => e.x >= wd.x0 - S), "coda");
+    else deco(notesEv.filter(e => e.x < wd.x1 + S).pop() || notesEv[notesEv.length - 1], wd.kind);
+  }
+  for (const cd of mk.codas) { res.dbg.boxes.push({ ...cd.box, kind: "coda", label: "Coda" }); deco(notesEv.reduce((b2, e) => (!b2 || Math.abs(e.x - cd.x) < Math.abs(b2.x - cd.x) ? e : b2), null), "coda"); }
   ev.sort((a, b2) => a.x - b2.x);
   res.events = ev;
   return res;
@@ -1468,20 +1648,35 @@ function buildAbc(pages, opts) {
   const report = { staves: 0, systems: systems.length, notes: 0, rests: 0, measures: 0, bad: 0, ts: "", tsSource: "", key: "" };
   if (!systems.length) return { abc: "", report };
   const nv = Math.max(...systems.map(s => s.length));
+  const full = systems.find(s => s.length === nv);
   const clefs = [];
   for (let v = 0; v < nv; v++) {
-    const f = systems.find(s => s[v] && s[v].clef);
+    const f = systems.find(s => s.length === nv && s[v] && s[v].clef);
     clefs.push(f ? f[v].clef : (nv === 2 && v === 1 ? "bass" : "treble"));
   }
+  // Systeme mit weniger Zeilen: jede Zeile der Stimme mit passendem Schlüssel zuordnen (z. B. Bass bleibt Stimme 3)
+  const voiceOf = sys => {
+    if (sys.length === nv) return sys.map((_, j) => j);
+    const out = []; let next = 0;
+    sys.forEach((st, j) => {
+      const left = sys.length - j - 1;
+      let v = -1;
+      for (let k = next; k <= nv - 1 - left; k++) if (clefs[k] === st.clef) { v = k; break; }
+      if (v < 0) v = Math.min(next, nv - 1 - left);
+      out.push(v); next = v + 1;
+    });
+    return out;
+  };
+  void full;
   const votes = {};
   systems.forEach(s => s.forEach(st => { report.staves++; const k = st.sharps >= st.flats ? st.sharps : -st.flats; votes[k] = (votes[k] || 0) + 1; }));
   const keyN = +Object.keys(votes).sort((a, b) => votes[b] - votes[a] || Math.abs(a) - Math.abs(b))[0];
   // Taktmaße aus der obersten Stimme
   const sums = []; let acc = 0, any = false; const flatEv = [];
-  systems.forEach(s => { if (s[0]) s[0].events.forEach(e => { if (e.type === "bar" || (e.v || 1) === 1) flatEv.push(e); }); });
+  systems.forEach(s => { if (s[0]) s[0].events.forEach(e => { if (e.type === "bar" || e.v !== 2) flatEv.push(e); }); });
   for (const e of flatEv) {
     if (e.type === "bar") { if (any) sums.push(acc); acc = 0; any = false; }
-    else { acc += e.dur; any = true; }
+    else if (e.type === "note" || e.type === "rest") { acc += e.dur; any = true; }
   }
   if (any) sums.push(acc);
   const cnt = {}; sums.forEach(v => { cnt[v] = (cnt[v] || 0) + 1; });
@@ -1512,11 +1707,12 @@ function buildAbc(pages, opts) {
   let minor = false;
   const lastSys = systems[systems.length - 1], lowSt = lastSys[lastSys.length - 1];
   const lastNote = lowSt && [...lowSt.events].reverse().find(e => e.type === "note");
-  if (lastNote) {
-    const vIdx = lastSys.length - 1, clef = lowSt.clef || clefs[vIdx] || "treble";
-    const d = TOP[clef] - lastNote.heads[0].p, letter = "CDEFGAB"[((d % 7) + 7) % 7];
+  const firstSys = systems[0], lowFirst = firstSys[firstSys.length - 1];
+  const firstNote = lowFirst && lowFirst.events.find(e => e.type === "note");
+  const letterOf = (st, n) => { const clef = st.clef || "treble"; const d = (TOP[clef] || 38) - n.heads[0].p; return "CDEFGAB"[((d % 7) + 7) % 7]; };
+  if (lastNote && firstNote) {
     const mt = (keyN >= 0 ? SHARP_MIN[keyN] : FLAT_MIN[-keyN]) || "A";
-    if (mt[0] === letter) minor = true;
+    if (mt[0] === letterOf(lowSt, lastNote) && mt[0] === letterOf(lowFirst, firstNote)) minor = true;
   }
   const key = minor ? (keyN >= 0 ? SHARP_MIN[keyN] : FLAT_MIN[-keyN]) + "m" : (keyN >= 0 ? SHARP_KEYS[keyN] : FLAT_KEYS[-keyN]);
   report.key = key;
@@ -1540,7 +1736,7 @@ function buildAbc(pages, opts) {
         if (e.type === "rest") { tok = e.full ? "Z" : "z" + lenStr(e.dur); report.rests++; }
         else {
           const ps = [...new Set(e.heads.map(hd => (hd.acc ? ACC[hd.acc] : "") + abcPitch(top - hd.p)))];
-          tok = (e.fermata ? "!fermata!" : "") + (ps.length > 1 ? "[" + ps.join("") + "]" : ps[0]) + lenStr(e.dur);
+          tok = (e.deco || []).map(d => "!" + d + "!").join("") + (e.fermata ? "!fermata!" : "") + (ps.length > 1 ? "[" + ps.join("") + "]" : ps[0]) + lenStr(e.dur);
           report.notes++;
         }
         const join = prev && e.type === "note" && prev.beamR > 0 && e.beamL > 0 && prev.dur < 4 && e.dur < 4;
@@ -1552,12 +1748,13 @@ function buildAbc(pages, opts) {
     let out = "", meas = [];
     const flush = () => {
       if (!meas.length) return;
-      const v1 = meas.filter(e => (e.v || 1) === 1), v2 = meas.filter(e => e.v === 2);
+      const v1 = meas.filter(e => e.v !== 2), v2 = meas.filter(e => e.v === 2 || e.v === 0);
       out += " " + tokens(v1) + (st.twoVoice && v2.length ? " & " + tokens(v2) : "");
       meas = [];
     };
     for (const e of evs) {
       if (e.type === "bar") { flush(); out += " " + e.kind + " "; continue; }
+      if (e.type === "volta") { flush(); out = out.trimEnd(); out += (/[|\]:]$/.test(out) ? "" : " ") + "[" + e.n + " "; continue; }
       meas.push(e);
     }
     flush();
@@ -1574,9 +1771,10 @@ function buildAbc(pages, opts) {
   } else head.push("K:" + key + (clefs[0] !== "treble" ? " clef=" + clefs[0] : ""));
   const body = [];
   for (const s of systems) {
+    const vmap = voiceOf(s);
     s.forEach((st, j) => {
-      const clef = st.clef || clefs[j];
-      body.push((nv > 1 ? `[V:${j + 1}] ` : "") + staffAbc(st, clef));
+      const v = vmap[j], clef = st.clef || clefs[v];
+      body.push((nv > 1 ? `[V:${v + 1}] ` : "") + staffAbc(st, clef));
     });
   }
   // Schlussstrich
@@ -1590,7 +1788,7 @@ function buildAbc(pages, opts) {
   return { abc: head.concat(body).join("\n"), report };
 }
 
-return { processPage, buildAbc, zoneFeatures, tightBox };
+return { processPage, buildAbc, zoneFeatures, tightBox, gridFeatures };
 })();
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/abcjs/6.4.4/abcjs-basic-min.js"></script>
@@ -1670,7 +1868,9 @@ function keyOf(visual) {
   let ks = null;
   try { ks = visual && visual.getKeySignature(); } catch (e) {}
   const root = ks && LETTER_PC[ks.root] !== undefined ? ks.root : "C";
-  const acc = ks && ks.acc ? ks.acc : "";
+  // abcjs meldet Vorzeichen als "b" / "#" (ältere Versionen als "flat" / "sharp")
+  const rawAcc = ks && ks.acc ? String(ks.acc) : "";
+  const acc = rawAcc === "b" || rawAcc === "flat" ? "flat" : rawAcc === "#" || rawAcc === "sharp" ? "sharp" : "";
   const mode = ks && ks.mode ? ks.mode : "";
   const pc = (LETTER_PC[root] + (acc === "sharp" ? 1 : acc === "flat" ? -1 : 0) + 12) % 12;
   return { root, acc, mode, pc, minor: isMinor(mode) };
@@ -1971,14 +2171,158 @@ function highlighter(container) {
     }
   };
 }
+/* ---------- Ablauf auflösen: D.C., D.S., Fine, Coda (Wiederholungen und 1./2. Mal inklusive) ---------- */
+const JUMP_RX = /^D\.[CS]\./;
+function measuresOf(abc, tune) {
+  // Takte je Notenzeile (Stimme) mit Wiederholungs-, Klammer- und Ablaufmarken
+  const staffs = new Map(); // Stimmenkennung -> Takte
+  const voiceAt = pos => {
+    const ls = abc.lastIndexOf("\n", pos - 1) + 1, le = abc.indexOf("\n", pos);
+    const m = abc.slice(ls, le < 0 ? undefined : le).match(/^\s*\[V:\s*([^\]\s]+)/);
+    return m ? m[1] : "1";
+  };
+  const textFlag = (flags, name) => {
+    const t = String(name || "").toLowerCase().replace(/\s+/g, "");
+    if (t === "fine") flags.fine = true;
+    else if (/^(d\.?c\.?|dacapo)alfine$/.test(t)) flags["D.C.alfine"] = true;
+    else if (/^(d\.?s\.?|dalsegno)alfine$/.test(t)) flags["D.S.alfine"] = true;
+    else if (/^(d\.?c\.?|dacapo)alcoda$/.test(t)) flags["D.C.alcoda"] = true;
+    else if (/^(d\.?s\.?|dalsegno)alcoda$/.test(t)) flags["D.S.alcoda"] = true;
+    else if (/^(d\.c\.|dacapo)$/.test(t)) flags["D.C."] = true;
+    else if (/^(d\.s\.|dalsegno)$/.test(t)) flags["D.S."] = true;
+    else if (/^(tocoda|coda)$/.test(t)) flags.coda = true;
+  };
+  const perLine = []; // je System: Stimmenkennung -> Takte dieses Systems
+  tune.lines.forEach((line, li) => (line.staff || []).forEach(st => {
+    const vo = st.voices && st.voices[0]; if (!vo) return;
+    const firstNote = vo.find(e => e.el_type === "note" && e.startChar >= 0);
+    if (!firstNote) return;
+    const vid = voiceAt(firstNote.startChar);
+    if (!staffs.has(vid)) staffs.set(vid, []);
+    const list = [];
+    (perLine[li] = perLine[li] || new Map()).set(vid, list);
+    let cur = null, pendRep = false, pendEnd = null;
+    const open = from => { cur = { from, startRep: pendRep, ending: pendEnd, flags: {} }; pendRep = false; pendEnd = null; };
+    const close = to => { if (cur && cur.from != null && to > cur.from) { cur.text = abc.slice(cur.from, to); if (/[A-Ga-gzZx]/.test(cur.text)) list.push(cur); } cur = null; };
+    let lastEnd = 0;
+    for (const e of vo) {
+      if (e.endChar) lastEnd = Math.max(lastEnd, e.endChar);
+      if (e.el_type === "bar") {
+        close(e.startChar);
+        const last = list[list.length - 1];
+        if (/right_repeat|dbl_repeat/.test(e.type) && last) last.endRep = true;
+        if (e.endEnding && last) last.endsEnding = true;
+        if (/left_repeat|dbl_repeat/.test(e.type)) pendRep = true;
+        if (e.startEnding) pendEnd = String(e.startEnding);
+        open(e.endChar);
+        continue;
+      }
+      if (!cur && e.el_type === "note" && e.startChar >= 0) open(e.startChar);
+      if (cur && e.el_type === "note") {
+        (e.decoration || []).forEach(d => { if (d === "fine" || d === "coda" || d === "segno" || JUMP_RX.test(d)) cur.flags[d] = true; });
+        (e.chord || []).forEach(c => textFlag(cur.flags, c.name));
+      }
+    }
+    close(lastEnd);
+  }));
+  // Systemweise ausrichten: fehlende Stimmen bekommen Ganztaktpausen, damit alle Stimmen gleich lang bleiben
+  const ids = [...staffs.keys()];
+  perLine.forEach(map => {
+    if (!map) return;
+    const n = Math.max(...[...map.values()].map(l => l.length));
+    ids.forEach(id => {
+      const l = map.get(id) || [];
+      for (let k = 0; k < n; k++) staffs.get(id).push(l[k] || { text: "Z", flags: {}, filler: true });
+    });
+  });
+  return ids.map(id => Object.assign(staffs.get(id), { id }));
+}
+// Gemeinsame Ablaufstruktur aller Stimmen (Wiederholungen, Klammern, Sprünge)
+function mergedStructure(staffs) {
+  const n = Math.max(...staffs.map(l => l.length)), out = [];
+  for (let k = 0; k < n; k++) {
+    const m = { flags: {} };
+    for (const l of staffs) {
+      const x = l[k]; if (!x || x.filler) continue;
+      if (x.startRep) m.startRep = true; if (x.endRep) m.endRep = true; if (x.endsEnding) m.endsEnding = true;
+      if (x.ending && !m.ending) m.ending = x.ending;
+      Object.assign(m.flags, x.flags);
+    }
+    out.push(m);
+  }
+  return out;
+}
+function playOrder(ms) {
+  const n = ms.length, order = [];
+  // aktive Klammer je Takt und größte Klammernummer der Gruppe
+  const end = []; let act = null;
+  for (let k = 0; k < n; k++) { if (ms[k].ending) act = ms[k].ending; end[k] = act; if (ms[k].endsEnding || ms[k].endRep) act = null; }
+  const nums = e => String(e).split(/[,\-]/).map(Number).filter(Boolean);
+  const groupMax = new Array(n).fill(0);
+  for (let k = 0; k < n; k++) if (end[k]) { let j = k; while (j < n && end[j]) j++; const mx = Math.max(...end.slice(k, j).flatMap(nums)); for (let q = k; q < j; q++) groupMax[q] = mx; k = j - 1; }
+  const segno = ms.findIndex(m => m.flags.segno);
+  const codas = ms.map((m, k) => (m.flags.coda ? k : -1)).filter(k => k >= 0);
+  let i = 0, jumped = false, toCoda = false, repStart = 0, pass = 1, guard = 0;
+  const repeated = new Set();
+  while (i < n && guard++ < n * 8) {
+    const m = ms[i];
+    if (m.startRep && !jumped && repStart !== i) { repStart = i; pass = 1; }
+    if (end[i]) {
+      const want = jumped ? groupMax[i] : pass;
+      if (!nums(end[i]).includes(want)) { i++; continue; }
+    }
+    order.push(i);
+    if (jumped && m.flags.fine) break;
+    if (jumped && toCoda && codas.length >= 2 && i === codas[0]) { i = codas[1]; continue; }
+    if (m.endRep && !jumped && !repeated.has(i)) { repeated.add(i); pass++; i = repStart; continue; }
+    if (m.endRep) { pass = 1; repStart = i + 1; }
+    const jump = Object.keys(m.flags).find(k => JUMP_RX.test(k));
+    if (jump && !jumped) { jumped = true; toCoda = /coda/.test(jump); i = jump.startsWith("D.S.") && segno >= 0 ? segno : 0; continue; }
+    i++;
+  }
+  return order;
+}
+const unrollCache = new Map();
+function unrollAbc(abc) {
+  if (unrollCache.has(abc)) return unrollCache.get(abc);
+  let result = null;
+  try {
+    const tune = ABCJS.parseOnly(abc)[0];
+    const staffs = measuresOf(abc, tune);
+    const hasJump = staffs.some(list => list.some(m => Object.keys(m.flags).some(k => JUMP_RX.test(k))));
+    if (hasJump && staffs.length) {
+      const order = playOrder(mergedStructure(staffs)), orders = staffs.map(() => order);
+      // Kopf (Felder vor dem ersten Notentext) übernehmen
+      const lines = abc.split("\n"), head = [];
+      for (const ln of lines) { if (/^\s*([A-Za-z]:|%)/.test(ln) && !/^\s*\[V:/.test(ln)) head.push(ln); else if (ln.trim()) break; }
+      const multi = head.filter(l => /^V:/.test(l)).length > 1;
+      const len = Math.max(...orders.map(o => o.length)), body = [];
+      for (let c = 0; c < len; c += 8) staffs.forEach((list, si) => {
+        const chunk = orders[si].slice(c, c + 8).map(k => list[k].text.trim()).filter(Boolean);
+        if (!chunk.length) return;
+        body.push((multi ? `[V:${list.id}] ` : "") + chunk.join(" | ") + (c + 8 >= len ? " |]" : " |"));
+      });
+      const text = head.concat(body).join("\n");
+      const t2 = ABCJS.parseOnly(text)[0];
+      if (t2 && t2.lines && t2.lines.length) result = { text, tune: t2, measures: orders[0].length };
+    }
+  } catch (e) { console.warn("Ablauf konnte nicht aufgelöst werden", e); result = null; }
+  unrollCache.set(abc, result);
+  return result;
+}
+
 function togglePlay(which) {
   if (S.playing === which) { stopPlayback(); return; }
   stopPlayback();
-  const v = which === "orig" ? S.vOrig : S.vTr;
+  const v0 = which === "orig" ? S.vOrig : S.vTr;
   const container = which === "orig" ? $("#scoreOrig") : $("#scoreTr");
-  if (!v) return;
+  if (!v0) return;
+  // Mit D.C./D.S./Fine wird ein aufgelöster Ablauf gespielt (ohne Mitlesen im Notenbild)
+  const un = unrollAbc(which === "orig" ? S.abc : S.abcTr);
+  const v = un ? un.tune : v0;
+  if (un) toast("Ablauf mit Sprüngen (D.C./Fine) wird abgespielt.");
   const ok = Synth.play(v, {
-    inst: S.inst, speed: S.speed, chords: S.chords, highlight: highlighter(container),
+    inst: S.inst, speed: S.speed, chords: S.chords, highlight: un ? null : highlighter(container),
     onEnd: () => { S.playing = null; container.querySelectorAll(".hl").forEach(e => e.classList.remove("hl")); syncPlayers(); }
   });
   if (!ok) { toast("Wiedergabe ist in diesem Browser nicht möglich."); return; }
@@ -2121,6 +2465,25 @@ function digitTemplates() {
   }
   return (TEMPLATES = out);
 }
+// WORD_TEMPLATES_START
+// Vorlagen für Ablauftexte, aus Systemschriften gerendert (normal und kursiv)
+let WORDS = null;
+function wordTemplates() {
+  if (WORDS) return WORDS;
+  const texts = [["Fine", "fine"], ["D.C. al Fine", "D.C.alfine"], ["Da Capo al Fine", "D.C.alfine"], ["D.S. al Fine", "D.S.alfine"], ["D.C. al Coda", "D.C.alcoda"], ["D.S. al Coda", "D.S.alcoda"], ["D.C.", "D.C."], ["Da Capo", "D.C."], ["D.S.", "D.S."], ["Coda", "coda"], ["To Coda", "coda"]];
+  const fonts = ['60px "Times New Roman", Times, serif', 'italic 60px "Times New Roman", Times, serif', '60px Georgia, serif', 'italic 60px Georgia, serif', 'bold 60px "Times New Roman", serif', 'bold italic 60px serif'];
+  const out = [];
+  for (const font of fonts) for (const [txt, kind] of texts) {
+    const c = document.createElement("canvas"); c.width = 700; c.height = 120;
+    const x = c.getContext("2d");
+    x.fillStyle = "#fff"; x.fillRect(0, 0, 700, 120); x.fillStyle = "#000"; x.font = font; x.textBaseline = "alphabetic"; x.fillText(txt, 10, 85);
+    const d = x.getImageData(0, 0, 700, 120).data, get = (xx, yy) => d[(yy * 700 + xx) * 4] < 128;
+    const tb = OMR.tightBox(get, 0, 0, 699, 119); if (!tb) continue;
+    out.push({ kind, a: (tb.x1 - tb.x0 + 1) / (tb.y1 - tb.y0 + 1), f: OMR.gridFeatures(get, tb.x0, tb.y0, tb.x1, tb.y1) });
+  }
+  return (WORDS = out);
+}
+// WORD_TEMPLATES_END
 async function prepImage(p, max) {
   // Drehung anwenden und Größe begrenzen
   let bmp;
@@ -2152,14 +2515,14 @@ async function recognize() {
   ocrCtl = new AbortController();
   const myCtl = ocrCtl, n = S.photos.length, pages = [];
   try {
-    const templates = digitTemplates();
+    const templates = digitTemplates(), wordTpl = wordTemplates();
     for (let i = 0; i < n; i++) {
       if (myCtl.signal.aborted) throw { code: "cancelled" };
       const pre = `Seite ${i + 1} von ${n}: `;
       setPhase(1 + Math.round(3 * i / n), pre + "Foto wird vorbereitet.");
       const cv = await prepImage(S.photos[i], 2600);
       const img = cv.getContext("2d").getImageData(0, 0, cv.width, cv.height);
-      const res = await runPage(img, { templates }, (msg, f) => setPhase(1 + Math.round(3 * (i + f) / n), pre + msg + "."), myCtl.signal);
+      const res = await runPage(img, { templates, wordTemplates: wordTpl }, (msg, f) => setPhase(1 + Math.round(3 * (i + f) / n), pre + msg + "."), myCtl.signal);
       // kleine Vorschau für die Anzeige der Erkennung
       const k = Math.min(1, 1400 / Math.max(cv.width, cv.height));
       const pv = document.createElement("canvas"); pv.width = Math.round(cv.width * k); pv.height = Math.round(cv.height * k);
@@ -2444,7 +2807,9 @@ $("#dlPdf").addEventListener("click", e => withBusy(e.currentTarget, async () =>
   footer();
   await offerFile(fileBase() + ".pdf", pdf.output("blob"));
 }));
-function midiBytes(visual) {
+function midiBytes(visual, abcText) {
+  const un = abcText ? unrollAbc(abcText) : null;
+  if (un) visual = un.tune;
   const m = ABCJS.synth.getMidiFile(visual, { midiOutputType: "binary", chordsOff: !S.chords, program: (Synth.INSTR[S.inst] || {}).gm || 0 });
   return m instanceof Uint8Array ? m : (Array.isArray(m) && m[0] instanceof Uint8Array ? m[0] : new Uint8Array(m));
 }
@@ -2475,10 +2840,10 @@ function zip(files) {
   return new Blob([...parts, ...central, new Uint8Array(e.buffer)], { type: "application/zip" });
 }
 $("#dlMidi").addEventListener("click", e => withBusy(e.currentTarget, async () => {
-  const tr = midiBytes(S.vTr);
+  const tr = midiBytes(S.vTr, S.abcTr);
   if (inArtifact) {
     const files = [{ name: fileBase() + ".mid", data: tr }];
-    if (S.steps !== 0 && S.vOrig) files.push({ name: slug(titleOf(S.vOrig)) + "_Original_" + slug(keyLabel(keyOf(S.vOrig))) + ".mid", data: midiBytes(S.vOrig) });
+    if (S.steps !== 0 && S.vOrig) files.push({ name: slug(titleOf(S.vOrig)) + "_Original_" + slug(keyLabel(keyOf(S.vOrig))) + ".mid", data: midiBytes(S.vOrig, S.abc) });
     await offerFile(fileBase() + "_MIDI.zip", zip(files));
   } else {
     await offerFile(fileBase() + ".mid", new Blob([tr], { type: "audio/midi" }));
