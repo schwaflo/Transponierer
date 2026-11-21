@@ -1031,7 +1031,7 @@ function detectAnnotations(ctx, staves, holeList, wordTemplates) {
           if (c > bs) { bs = c; best = t; }
         }
         if (ctx.debug) (marks[si].dbgWords = marks[si].dbgWords || []).push({ x: ph.x0, a: +a.toFixed(2), n: ph.n, best: best && best.kind, c: +bs.toFixed(2) });
-        if (best && bs >= 0.5) {
+        if (best && bs >= 0.46) {
           marks[si].words.push({ kind: best.kind, x0: ph.x0, x1: ph.x1, box: { x0: ph.x0, y0: ph.y0, x1: ph.x1, y1: ph.y1 } });
           ph.ids.forEach(id => skip.add(id));
         }
@@ -1510,7 +1510,19 @@ function readStaff(ctx, s, si, all, ov) {
     return true;
   };
   const glyphs = groupGlyphs(restC.filter(c => !isDot(c) && !isFermata(c)), S);
+  const compById = new Map(restC.map(c => [c.id, c]));
   for (const gl of glyphs) {
+    // zwei kleine Flecke übereinander (Wiederholungspunkte), auch wenn sie nicht ganz rund sind
+    if (gl.ids.size === 2) {
+      const cs = [...gl.ids].map(id => compById.get(id)).filter(Boolean);
+      if (cs.length === 2 && cs.every(c => (c.x1 - c.x0 + 1) <= 0.75 * S && (c.y1 - c.y0 + 1) <= 0.75 * S)) {
+        const ps = cs.map(c => s.posOf((c.y0 + c.y1) / 2, (c.x0 + c.x1) / 2)).sort((a, b2) => a - b2);
+        if (Math.abs(ps[0] - 3) < 1 && Math.abs(ps[1] - 5) < 1) {
+          cs.forEach(c => dots.push({ x: (c.x0 + c.x1) / 2, y: (c.y0 + c.y1) / 2, r: (c.x1 - c.x0 + 1) / 2 }));
+          continue;
+        }
+      }
+    }
     const gw = (gl.x1 - gl.x0 + 1) / S, gh = (gl.y1 - gl.y0 + 1) / S, cx = (gl.x0 + gl.x1) / 2, cy = (gl.y0 + gl.y1) / 2;
     const gfill = gl.n / ((gl.x1 - gl.x0 + 1) * (gl.y1 - gl.y0 + 1));
     // Fermate: flacher Bogen über oder unter einer Note
@@ -1539,7 +1551,9 @@ function readStaff(ctx, s, si, all, ov) {
 
   /* ---- Taktstriche ---- */
   const barSegs = segs.filter(sg => !used.has(sg) && sg.x > contentStart && sg.x <= s.x1 + 0.6 * S &&
-    sg.top <= s.top(sg.x) + 0.6 * S && sg.bot >= s.bot(sg.x) - 0.6 * S && !notes.some(n => Math.abs(n.x - sg.x) < 0.25 * S));
+    sg.top <= s.top(sg.x) + 0.6 * S && sg.bot >= s.bot(sg.x) - 0.6 * S && !notes.some(n => Math.abs(n.x - sg.x) < 0.25 * S) &&
+    // zwei übereinanderstehende Hälse (Stimme oben/unten) sind kein Taktstrich: dort sitzt ein Notenkopf direkt am Strich
+    !goodHeads.some(hd => Math.abs(hd.x - sg.x) < 0.8 * S && hd.y > sg.top - 0.3 * S && hd.y < sg.bot + 0.3 * S));
   barSegs.sort((a, b2) => a.x - b2.x);
   const bars = [];
   for (const sg of barSegs) {
@@ -1742,6 +1756,19 @@ function repairSystems(systems, measure16) {
       if (near.length) near.forEach(c => { if (!/:/.test(c.kind)) c.kind = rb.kind; });
       else { st.events.push({ type: "bar", x: rb.x, kind: rb.kind }); st.events.sort((a, b) => a.x - b.x); }
     }
+    // 2b) vor einer 2. (oder späteren) Klammer steht immer ein Wiederholungsstrich
+    for (const st of sys) {
+      st.events.forEach((e, k) => {
+        if (e.type !== "volta" || e.n < 2) return;
+        for (let j = k - 1; j >= 0; j--) {
+          const b = st.events[j];
+          if (b.type === "bar") { if (!/:/.test(b.kind)) b.kind = ":|"; break; }
+          if (b.type === "note" || b.type === "rest") break;
+        }
+      });
+    }
+    // 2c) Brevis gibt es nur, wenn sie in den Takt passt; sonst ganze Note
+    for (const st of sys) st.events.forEach(e => { if ((e.type === "note" || e.type === "rest") && e.dur > measure16) e.dur = measure16; });
     // 3) Rhythmus
     const vms = [];
     for (const st of sys) {
@@ -1845,6 +1872,17 @@ function buildAbc(pages, opts) {
   const measure16 = num * 16 / den;
   report.ts = num + "/" + den;
   repairSystems(systems, measure16);
+  // „Fine“ ohne Rücksprung ergibt keinen Sinn: dann endet das Stück mit D.C. al Fine
+  {
+    const allNotes = systems.flatMap(s => s.flatMap(st => st.events.filter(e => e.type === "note")));
+    const hasFine = allNotes.some(e => (e.deco || []).includes("fine"));
+    const hasJump = allNotes.some(e => (e.deco || []).some(d => /^D\.[CS]\./.test(d)));
+    if (hasFine && !hasJump) {
+      const lastSys2 = systems[systems.length - 1];
+      for (const st of lastSys2) { const ln = [...st.events].reverse().find(e => e.type === "note"); if (ln) { (ln.deco = ln.deco || []).push("D.C.alfine"); break; } }
+      report.dcInferred = true;
+    }
+  }
   {
     // Taktsummen nach der Reparatur neu zählen
     const sums2 = []; let a2 = 0, any2 = false;
@@ -2624,7 +2662,9 @@ let WORDS = null;
 function wordTemplates() {
   if (WORDS) return WORDS;
   const texts = [["Fine", "fine"], ["D.C. al Fine", "D.C.alfine"], ["Da Capo al Fine", "D.C.alfine"], ["D.S. al Fine", "D.S.alfine"], ["D.C. al Coda", "D.C.alcoda"], ["D.S. al Coda", "D.S.alcoda"], ["D.C.", "D.C."], ["Da Capo", "D.C."], ["D.S.", "D.S."], ["Coda", "coda"], ["To Coda", "coda"]];
-  const fonts = ['60px "Times New Roman", Times, serif', 'italic 60px "Times New Roman", Times, serif', '60px Georgia, serif', 'italic 60px Georgia, serif', 'bold 60px "Times New Roman", serif', 'bold italic 60px serif'];
+  const fonts = ['60px "Times New Roman", Times, serif', 'italic 60px "Times New Roman", Times, serif', '60px Georgia, serif', 'italic 60px Georgia, serif',
+    'bold 60px "Times New Roman", serif', 'bold italic 60px serif', '60px serif', 'italic 60px serif', '60px Palatino, "Palatino Linotype", "Book Antiqua", serif',
+    'italic 60px Palatino, "Palatino Linotype", serif', '60px Baskerville, "Baskerville Old Face", serif', '60px "Noto Serif", "DejaVu Serif", serif', '60px Helvetica, Arial, sans-serif'];
   const out = [];
   for (const font of fonts) for (const [txt, kind] of texts) {
     const c = document.createElement("canvas"); c.width = 700; c.height = 120;
@@ -2714,6 +2754,7 @@ async function recognize() {
 function scanSummary(rep, warn) {
   const parts = [`${rep.staves} Notenzeilen, ${rep.notes} Noten, ${rep.rests} Pausen`];
   parts.push(`Taktart ${rep.ts} (${rep.tsSource}), Tonart ${rep.key}`);
+  if (rep.dcInferred) parts.push("„D.C. al Fine“ am Schluss ergänzt, weil ein Fine ohne Rücksprung gefunden wurde");
   if (rep.measures > 2) parts.push(rep.bad ? `${rep.bad} von ${rep.measures} Takten passen rechnerisch nicht zur Taktart, dort lohnt sich ein Blick` : "Alle Takte gehen rechnerisch auf");
   return parts.join(". ") + "." + (warn.length ? " " + warn[0] : "");
 }
