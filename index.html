@@ -1712,6 +1712,79 @@ function lenStr(n16) {
   const g = gcd(k, 4), num = k / g, den = 4 / g;
   return den === 1 ? String(num) : (num === 1 ? "/" + den : num + "/" + den);
 }
+// Abgleich innerhalb eines Systems: leere Takte entfernen, Wiederholungszeichen angleichen,
+// Notenwerte über die senkrechte Ausrichtung reparieren (was übereinander steht, erklingt gleichzeitig)
+const ALLOWED_DUR = new Set([1, 2, 3, 4, 6, 8, 12, 16, 24, 32]);
+function repairSystems(systems, measure16) {
+  for (const sys of systems) {
+    // 1) leere Takte und Taktstriche am Zeilenanfang entfernen
+    for (const st of sys) {
+      const evs = []; let content = false;
+      for (const e of st.events) {
+        if (e.type === "bar") {
+          const prev = evs[evs.length - 1];
+          if (!content) {
+            if (!prev) continue;
+            if (prev.type === "bar") { if (e.kind !== "|") prev.kind = e.kind; continue; }
+          }
+          evs.push(e); content = false;
+        } else { evs.push(e); if (e.type === "note" || e.type === "rest") content = true; }
+      }
+      st.events = evs;
+    }
+    // 2) Wiederholungszeichen im ganzen System angleichen
+    const repBars = [];
+    sys.forEach(st => st.events.forEach(e => { if (e.type === "bar" && /:/.test(e.kind)) repBars.push(e); }));
+    for (const rb of repBars) for (const st of sys) {
+      const S = st.S || 16;
+      if (rb.x < st.x0 - S || rb.x > st.x1 + S) continue;
+      const near = st.events.filter(e => e.type === "bar" && Math.abs(e.x - rb.x) < 1.2 * S);
+      if (near.length) near.forEach(c => { if (!/:/.test(c.kind)) c.kind = rb.kind; });
+      else { st.events.push({ type: "bar", x: rb.x, kind: rb.kind }); st.events.sort((a, b) => a.x - b.x); }
+    }
+    // 3) Rhythmus
+    const vms = [];
+    for (const st of sys) {
+      for (const v of st.twoVoice ? [1, 2] : [1]) {
+        let cur = { st, v, x0: st.x0, evs: [] };
+        for (const e of st.events) {
+          if (e.type === "bar") { cur.x1 = e.x; if (cur.evs.length) vms.push(cur); cur = { st, v, x0: e.x, evs: [] }; continue; }
+          if (e.type !== "note" && e.type !== "rest") continue;
+          const ev = e.v == null ? 1 : e.v;
+          if (v === 1 ? ev !== 2 : (ev === 2 || ev === 0)) cur.evs.push(e);
+        }
+        cur.x1 = st.x1; if (cur.evs.length) vms.push(cur);
+      }
+    }
+    const sumOf = m => m.evs.reduce((a, e) => a + e.dur, 0);
+    vms.forEach(m => { m.ok = Math.abs(sumOf(m) - measure16) < 1e-6; });
+    for (const m of vms) {
+      if (m.ok) continue;
+      const S = m.st.S || 16;
+      const refs = vms.filter(r => r.ok && r !== m && Math.min(r.x1, m.x1) - Math.max(r.x0, m.x0) > 0.5 * Math.min(r.x1 - r.x0, m.x1 - m.x0));
+      if (!refs.length) continue;
+      const pts = [];
+      for (const r of refs) { let t = 0; for (const e of r.evs) { pts.push([e.x, t]); t += e.dur; } }
+      pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+      const tl = [];
+      for (const pt of pts) { const last = tl[tl.length - 1]; if (last && pt[0] - last[0] < 0.35 * S) continue; if (last && pt[1] <= last[1]) continue; tl.push(pt); }
+      if (!tl.length) continue;
+      tl.push([Math.max(m.x1, tl[tl.length - 1][0] + S), measure16]);
+      const at = x => {
+        if (x <= tl[0][0]) return tl[0][1];
+        for (let k = 1; k < tl.length; k++) { const [xa, ta] = tl[k - 1], [xb, tb] = tl[k]; if (x <= xb) return ta + (tb - ta) * (x - xa) / Math.max(1e-6, xb - xa); }
+        return measure16;
+      };
+      const ons = m.evs.map(e => Math.round(at(e.x)));
+      if (ons[0] <= 1) ons[0] = 0;
+      let good = ons[0] === 0;
+      for (let k = 1; k < ons.length && good; k++) if (ons[k] <= ons[k - 1]) good = false;
+      if (!good) continue;
+      const durs = ons.map((t, k) => (k + 1 < ons.length ? ons[k + 1] : measure16) - t);
+      if (durs.every(d => ALLOWED_DUR.has(d))) durs.forEach((d, k) => { m.evs[k].dur = d; m.evs[k].repaired = true; });
+    }
+  }
+}
 function buildAbc(pages, opts) {
   opts = opts || {};
   const systems = [];
@@ -1771,8 +1844,17 @@ function buildAbc(pages, opts) {
   if (tsFound && tsFound.common && num === 4 && den === 4) report.common = true;
   const measure16 = num * 16 / den;
   report.ts = num + "/" + den;
-  report.measures = sums.length;
-  report.bad = sums.filter((v, i) => v !== measure16 && i !== 0 && i !== sums.length - 1).length;
+  repairSystems(systems, measure16);
+  {
+    // Taktsummen nach der Reparatur neu zählen
+    const sums2 = []; let a2 = 0, any2 = false;
+    systems.forEach(s => { if (s[0]) s[0].events.forEach(e => {
+      if (e.type === "bar") { if (any2) sums2.push(a2); a2 = 0; any2 = false; }
+      else if ((e.type === "note" || e.type === "rest") && e.v !== 2) { a2 += e.dur; any2 = true; }
+    }); if (any2) { sums2.push(a2); a2 = 0; any2 = false; } });
+    report.measures = sums2.length;
+    report.bad = sums2.filter((v, i) => v !== measure16 && i !== 0 && i !== sums2.length - 1).length;
+  }
 
   // Moll? Schlusston der untersten Stimme
   let minor = false;
