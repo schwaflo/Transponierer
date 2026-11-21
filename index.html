@@ -1194,8 +1194,9 @@ function readStaff(ctx, s, si, all, ov) {
     const gw = gl.x1 - gl.x0 + 1, gh = gl.y1 - gl.y0 + 1;
     if (gw < 0.5 * S && gh > 3.4 * S) continue;
     if (gh > 9 * S) continue; // Akkolade oder Klammer über mehrere Zeilen
+    if (!U && gl.x0 < s.x0 + 0.15 * S && gw < 1.4 * S) continue; // Teil einer Klammer am Zeilenanfang, kein Schlüssel
     if (!U) { if ((gl.x0 + gl.x1) / 2 <= s.x0 + 3.4 * S && gh >= 1.2 * S) U = { x0: gl.x0, y0: gl.y0, x1: gl.x1, y1: gl.y1 }; }
-    else if (gl.x0 <= U.x1 + 0.15 * S) U = { x0: Math.min(U.x0, gl.x0), y0: Math.min(U.y0, gl.y0), x1: Math.max(U.x1, gl.x1), y1: Math.max(U.y1, gl.y1) };
+    else if (gl.x0 <= U.x1 + 0.15 * S && (gh < 0.8 * S || gl.x0 <= U.x1 + 0.05 * S || (U.y1 - U.y0) < 2 * S)) U = { x0: Math.min(U.x0, gl.x0), y0: Math.min(U.y0, gl.y0), x1: Math.max(U.x1, gl.x1), y1: Math.max(U.y1, gl.y1) };
   }
   if (U) {
     const H = (U.y1 - U.y0 + 1) / S, above = (top - U.y0) / S, below = (U.y1 - bot) / S;
@@ -1821,6 +1822,36 @@ function repairSystems(systems, measure16) {
       if (!good) continue;
       const durs = ons.map((t, k) => (k + 1 < ons.length ? ons[k + 1] : measure16) - t);
       if (durs.every(d => ALLOWED_DUR.has(d))) durs.forEach((d, k) => { m.evs[k].dur = d; m.evs[k].repaired = true; });
+    }
+    // 4) Längenausgleich: stimmt eine andere Stimme im selben Takt, wird diese Stimme auf genau die Taktlänge gebracht,
+    //    damit die Stimmen nicht auseinanderlaufen (fehlende Zeit = Pause, Überschuss am Ende gekürzt)
+    vms.forEach(m => { m.ok = Math.abs(sumOf(m) - measure16) < 1e-6; });
+    for (const m of vms) {
+      if (m.ok) continue;
+      const hasRef = vms.some(r => r.ok && r !== m && Math.min(r.x1, m.x1) - Math.max(r.x0, m.x0) > 0.5 * Math.min(r.x1 - r.x0, m.x1 - m.x0));
+      if (!hasRef) continue;
+      let diff = measure16 - sumOf(m);
+      const st = m.st, vv = m.v === 2 ? 2 : 1;
+      if (diff > 0) {
+        const last = m.evs[m.evs.length - 1];
+        let xx = last.x + 0.01;
+        for (const d of [16, 8, 4, 2, 1]) while (diff >= d) { st.events.push({ type: "rest", x: xx, dur: d, kind: "fill", v: st.twoVoice ? vv : 1, filled: true }); xx += 0.01; diff -= d; }
+        st.events.sort((a, b) => a.x - b.x);
+      } else if (diff < 0) {
+        let excess = -diff;
+        for (let k = m.evs.length - 1; k >= 0 && excess > 0; k--) {
+          const e = m.evs[k];
+          const nd = e.dur - excess;
+          if (nd > 0 && ALLOWED_DUR.has(nd)) { e.dur = nd; excess = 0; }
+          else if (e.dur <= excess) { excess -= e.dur; e.dropped = true; }
+          else {
+            // auf den nächstkleineren erlaubten Wert kürzen
+            const cand = [...ALLOWED_DUR].filter(d => d < e.dur && e.dur - d <= excess).sort((a, b) => b - a)[0];
+            if (cand) { excess -= e.dur - cand; e.dur = cand; }
+          }
+        }
+        st.events = st.events.filter(e => !e.dropped);
+      }
     }
   }
 }
